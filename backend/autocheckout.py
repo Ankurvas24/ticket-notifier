@@ -51,6 +51,11 @@ import threading
 import time
 from typing import Optional
 
+from playwright.async_api import Error as PlaywrightError
+
+from . import config
+from . import cookie_manager
+
 logger = logging.getLogger("ticketalert.checkout")
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1388,6 +1393,9 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             ctx_kwargs["proxy"] = proxy
 
         ctx = await browser.new_context(**ctx_kwargs)
+        
+        # ── Inject user cookies if provided ────────────────────────────
+        has_custom_cookies = await cookie_manager.inject_cookies_if_exist(ctx, session_id)
 
         # ── Apply stealth patches to context ───────────────────────────
         stealth_applied = False
@@ -1439,7 +1447,10 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             # /buytickets/ET... triggers the "suspicious entry" heuristic
             # and gets the session killed before we can see seats.
             try:
-                if is_bms:
+                if has_custom_cookies:
+                    logger.info(f"[{session_id}] Custom session loaded — skipping Akamai warmup")
+                    warmup_url = None
+                elif is_bms:
                     warmup_url = "https://in.bookmyshow.com/"
                 elif is_district:
                     warmup_url = "https://www.district.in/"

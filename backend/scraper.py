@@ -601,6 +601,10 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             ctx_kwargs["proxy"] = proxy
 
         context = await browser.new_context(**ctx_kwargs)
+        
+        # Inject user cookies to bypass Akamai
+        await cookie_manager.inject_cookies_if_exist(context, "scraper")
+        
         page = await context.new_page()
 
         # ── Apply stealth patches to page ─────────────────────────
