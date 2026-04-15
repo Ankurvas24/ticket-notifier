@@ -733,6 +733,41 @@ def check_now(watcher_id):
         save_data(data)
         return jsonify(watcher)
 
+@app.route("/api/watchers/<watcher_id>/debug", methods=["GET", "POST"])
+def debug_watcher(watcher_id):
+    """
+    Run a one-off Playwright scrape for this watcher and return EXACTLY what
+    BMS/District served — URL, title, status, a body snippet, and the list
+    of status phrases found. Useful for diagnosing "why is it always unknown?"
+    """
+    if not _validate_watcher_id(watcher_id):
+        return jsonify({"error": "Invalid watcher ID"}), 400
+    with _data_lock:
+        data = load_data()
+        watcher = next((w for w in data["watchers"] if w["id"] == watcher_id), None)
+    if not watcher:
+        return jsonify({"error": "Not found"}), 404
+    if not _owns_watcher(watcher):
+        return jsonify({"error": "Not authorized"}), 403
+
+    url = watcher.get("checkout_url") or watcher.get("url") or ""
+    if not url:
+        return jsonify({"error": "Watcher has no URL"}), 400
+
+    result = check_url_availability(url, use_browser=True)
+    return jsonify({
+        "watcher_id": watcher_id,
+        "url":        url,
+        "status":     result.get("status"),
+        "name":       result.get("name"),
+        "price":      result.get("price"),
+        "error":      result.get("error"),
+        "detail":     result.get("detail"),
+        "note":       ("Check Railway logs for '🔎 Playwright saw:' line "
+                       "with full URL/title/body snippet."),
+    })
+
+
 @app.route("/api/watchers/<watcher_id>/build-cart", methods=["POST"])
 def build_cart(watcher_id):
     """

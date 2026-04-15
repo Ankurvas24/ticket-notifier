@@ -133,6 +133,12 @@ UPCOMING_PHRASES = [
     "coming soon", "notify me", "sale starts",
     "goes on sale", "registration open", "sale opens",
     "ticket sales open", "sale will begin",
+    # IPL / cricket pre-sale language
+    "register interest", "bookings open on", "sale starts on",
+    "join the waitlist", "get notified", "early access",
+    "presale", "pre-sale", "sales opening",
+    "stay tuned", "will be announced", "tbd",
+    "opens in", "starts in",  # countdown timers
 ]
 AVAILABLE_PHRASES = [
     "book now", "buy now", "buy tickets", "get tickets",
@@ -622,6 +628,24 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
                     return None
 
             html = await page.content()
+
+            # ── VERBOSE DIAGNOSTIC — shows WHY unknown happens ──────
+            # Log the final URL, title, and a snippet of visible text so
+            # the user can see exactly what BMS is serving (pre-sale page,
+            # Cloudflare challenge, event info with no book button, etc.)
+            try:
+                final_title = await page.title()
+                body_text = (await page.evaluate(
+                    "document.body ? document.body.innerText.slice(0, 800) : ''"
+                ) or "").replace("\n", " | ")[:500]
+                logger.info(
+                    f"🔎 Playwright saw: url={page.url[:100]!r} "
+                    f"title={final_title[:80]!r} "
+                    f"body-head={body_text[:300]!r}"
+                )
+            except Exception:
+                pass
+
             if proxy:
                 _proxy_success()
             return html
