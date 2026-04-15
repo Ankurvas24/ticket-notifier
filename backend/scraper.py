@@ -104,7 +104,10 @@ def _get_requests_proxy() -> Optional[dict]:
         return None
     if not _proxy_is_healthy():
         return None
-    proxy_url = f"http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_SERVER}"
+    import urllib.parse
+    safe_user = urllib.parse.quote(PROXY_USERNAME, safe='')
+    safe_pass = urllib.parse.quote(PROXY_PASSWORD, safe='')
+    proxy_url = f"http://{safe_user}:{safe_pass}@{PROXY_SERVER}"
     return {"http": proxy_url, "https": proxy_url}
 
 
@@ -579,8 +582,7 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
 

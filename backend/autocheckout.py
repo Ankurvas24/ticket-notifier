@@ -1368,8 +1368,6 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             args=[
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
