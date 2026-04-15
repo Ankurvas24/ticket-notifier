@@ -804,16 +804,37 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
     Complete BookMyShow cart flow:
       popups → qty(max) → continue → category(cheapest) → subsection
       → seats(max) → WAIT FOR SEAT LOCK → Book → capture cart URL forms
+
+    Robust to partial failures — returns the best URL we got even if
+    seat selection failed (so the user can still open the page manually
+    with the bot's session cookies transferred).
     """
     await _bms_handle_popups(page, session_id)
     await _bms_select_quantity(page, session_id, max_qty)
     await _human_delay(0.5, 1.0)
     logger.info(f"[{session_id}] After qty: {page.url}")
 
+    # If URL got redirected to a non-event page during qty selection,
+    # bail early but still return a useful URL.
+    if any(k in page.url.lower() for k in ("/cinemas", "/movies", "/home")):
+        logger.warning(f"[{session_id}] Redirected during qty — abort seat pick")
+        return page.url
+
     await _bms_select_cheapest_category(page, session_id, target_price)
     await _bms_select_subsection(page, session_id)
 
     seats_selected = await _bms_select_max_seats(page, session_id, max_qty)
+    if not seats_selected:
+        # Log a prominent warning so user understands why cart is empty
+        logger.warning(
+            f"[{session_id}] ⚠️ 0 seats selected — likely causes: "
+            f"(1) seat map requires login, (2) Akamai bot-check, "
+            f"(3) sale hasn't actually opened, (4) selectors stale. "
+            f"Returning current URL so user can open it manually with "
+            f"transferred cookies."
+        )
+        _update(session_id, message="Could not auto-select seats — cookies captured so you can pick manually.")
+        return page.url
 
     # ── NETWORK INTERCEPTION — wait for seat lock before proceeding ──────
     if seats_selected:
@@ -1411,7 +1432,54 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
         page = await ctx.new_page()
 
         try:
-            # ── Navigate ─────────────────────────────────────────────────
+            is_bms      = "bookmyshow.com" in checkout_url.lower()
+            is_district = "district.in" in checkout_url.lower()
+
+            # ── AKAMAI WARMUP ─────────────────────────────────────────────
+            # Visit the site's homepage first so Akamai sets its _abck/bm_sz
+            # cookies via the legitimate bot-check script. Going STRAIGHT to
+            # /buytickets/ET... triggers the "suspicious entry" heuristic
+            # and gets the session killed before we can see seats.
+            try:
+                if is_bms:
+                    warmup_url = "https://in.bookmyshow.com/"
+                elif is_district:
+                    warmup_url = "https://www.district.in/"
+                else:
+                    warmup_url = None
+
+                if warmup_url:
+                    _update(session_id, message="Warming up session (Akamai handshake)...")
+                    logger.info(f"[{session_id}] Warmup → {warmup_url}")
+                    await page.goto(warmup_url, wait_until="domcontentloaded",
+                                    timeout=NAV_TIMEOUT_MS)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8_000)
+                    except Exception:
+                        pass
+                    # Small human-like mouse dance so Akamai's telemetry
+                    # sees a "real" user interacting with the page.
+                    try:
+                        await page.mouse.move(
+                            random.randint(200, 600),
+                            random.randint(150, 400),
+                            steps=random.randint(8, 18),
+                        )
+                        await _human_delay(0.4, 0.9)
+                        await page.mouse.move(
+                            random.randint(400, 900),
+                            random.randint(300, 600),
+                            steps=random.randint(8, 18),
+                        )
+                        await _human_scroll(page, 300)
+                    except Exception:
+                        pass
+                    await _human_delay(0.6, 1.4)
+                    logger.info(f"[{session_id}] Warmup done; now navigating to event")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Warmup step failed ({e}) — continuing")
+
+            # ── Navigate to the actual event/checkout URL ────────────────
             logger.info(f"[{session_id}] Navigating → {checkout_url}")
             _update(session_id, message="Navigating to event page...")
             await page.goto(checkout_url, wait_until="domcontentloaded",
@@ -1421,8 +1489,37 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             except Exception:
                 pass
 
-            is_bms      = "bookmyshow.com" in checkout_url.lower()
-            is_district = "district.in" in checkout_url.lower()
+            # ── BOT-CHECK DETECTION ──────────────────────────────────────
+            # If Akamai served the bot-challenge page, bail early so we
+            # don't loop trying to find seats on a challenge page.
+            try:
+                page_text = (await page.evaluate("document.body.innerText") or "").lower()
+                bot_check_markers = [
+                    "access denied", "reference #",
+                    "blocked by bot", "verify you are a human",
+                    "you don't have permission",
+                    "request unsuccessful", "incapsula",
+                ]
+                if any(m in page_text for m in bot_check_markers):
+                    logger.warning(
+                        f"[{session_id}] Bot-check page detected — "
+                        f"cookies still captured, cart_url will be derived"
+                    )
+                    _update(session_id,
+                            message="Akamai bot-check hit — capturing cookies anyway...")
+            except Exception:
+                pass
+
+            # Redirect-to-landing detection
+            final_url_lower = page.url.lower()
+            for junk in ("/cinemas", "/movies", "/home", "/explore",
+                         "/offers", "/search"):
+                if final_url_lower.rstrip("/").endswith(junk):
+                    logger.warning(
+                        f"[{session_id}] Redirected to landing ({page.url}) — "
+                        f"skipping cart flow, capturing cookies only"
+                    )
+                    break
 
             # ── Cart flow ────────────────────────────────────────────────
             cart_url = ""

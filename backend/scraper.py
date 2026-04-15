@@ -398,10 +398,14 @@ def _parse_html(html: str, url: str) -> dict:
             if phrase in btn_text and not disabled:
                 return {"status": "available", "name": name, "price": price}
 
-    # Fallback: check raw text for available phrases
-    for phrase in AVAILABLE_PHRASES:
-        if phrase in text:
-            return {"status": "available", "name": name, "price": price}
+    # Conservative fallback: only report "available" from raw text when
+    # we see at least TWO available phrases AND we're clearly on the event
+    # page (ET code present). Single-phrase matches caused the famous
+    # false-positive alerts from generic landing pages.
+    et_match = re.search(r"ET\d{6,12}", url)
+    hits = [p for p in AVAILABLE_PHRASES if p in text]
+    if len(hits) >= 2 and (not et_match or et_match.group(0).lower() in text):
+        return {"status": "available", "name": name, "price": price}
 
     return {"status": "unknown", "name": name, "price": price}
 
