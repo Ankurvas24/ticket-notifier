@@ -453,6 +453,31 @@ def _parse_html(html: str, url: str) -> dict:
     if len(hits) >= 2 and (not et_match or et_match.group(0).lower() in text):
         return {"status": "available", "name": name, "price": price}
 
+    # ── DIAGNOSTIC: log what we saw so user knows WHY "unknown" ──────────
+    # Print sample text + which phrases DID match (if any), so when the
+    # scraper says "unknown" you can see if BMS is showing some state we
+    # haven't wired up (like "Stay tuned", "Sale soon", etc.)
+    matched = {
+        "available": [p for p in AVAILABLE_PHRASES if p in text],
+        "sold_out":  [p for p in SOLD_OUT_PHRASES  if p in text],
+        "upcoming":  [p for p in UPCOMING_PHRASES  if p in text],
+    }
+    # Grab a 400-char snippet of interesting text
+    interesting_keywords = ("book", "ticket", "buy", "sold", "coming",
+                            "sale", "notify", "register", "soon", "starts",
+                            "opens", "queue", "wait")
+    snippet_hits = []
+    for line in text.split(". "):
+        if any(k in line for k in interesting_keywords):
+            snippet_hits.append(line.strip()[:120])
+            if len(snippet_hits) >= 4:
+                break
+    snippet = " || ".join(snippet_hits)[:400]
+    logger.info(
+        f"🔎 Parse result UNKNOWN | title={name!r} | "
+        f"matched={matched} | snippet={snippet!r}"
+    )
+
     return {"status": "unknown", "name": name, "price": price}
 
 
@@ -730,6 +755,11 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
         logger.debug(f"Direct requests failed: {e}")
 
     # ── Strategy 4: HTML fetch via proxy (if healthy) ────────────────────
+    # Keep the best result seen so far — we'll use it only if all later
+    # strategies also fail. This way Playwright gets a chance even when
+    # requests-via-proxy returns HTML with "unknown" status (static HTML
+    # often lacks the JS-rendered Book Now button).
+    best_proxy_result = None
     if _proxy_is_healthy():
         try:
             html = _fetch_with_requests(url, use_proxy=True)
@@ -740,7 +770,12 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
                     f"Scraper (proxy): {result['status']} for {url[:60]} "
                     f"in {elapsed:.1f}s"
                 )
-                return result
+                # Only return immediately if we got a CONFIDENT status.
+                # Unknown means static HTML didn't render cleanly — fall
+                # through to Playwright which executes JS.
+                if result["status"] != "unknown":
+                    return result
+                best_proxy_result = result
         except Exception as e:
             logger.debug(f"Proxy requests failed: {e}")
 
@@ -778,6 +813,15 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
                 return result
         except Exception as e:
             logger.warning(f"Playwright failed: {e}")
+
+    # ── If Playwright failed but requests-via-proxy gave us SOMETHING,
+    #    use that rather than saying "error". Still an "unknown" but at
+    #    least we got real HTML (so we know the name, etc.).
+    if best_proxy_result is not None:
+        logger.info(
+            f"Falling back to requests-via-proxy result (Playwright failed)"
+        )
+        return best_proxy_result
 
     # ── All methods exhausted ────────────────────────────────────────────
     elapsed = time.time() - start_time
