@@ -1181,6 +1181,12 @@
           ${w.price ? `<span class="watcher-price">${escHtml(w.price)}</span>` : ''}
           ${w.paused ? '<span class="status-badge unknown">PAUSED</span>' : ''}
         </div>
+        ${w.last_error ? `<div class="watcher-error"
+          style="margin-top:6px; padding:6px 8px; border-radius:6px;
+                 background:rgba(255,204,0,.08); border:1px solid rgba(255,204,0,.35);
+                 color:#ffd98a; font-size:11px; line-height:1.35;">
+          <strong>⚠ Blocked:</strong> ${escHtml(w.last_error)}
+        </div>` : ''}
       </div>
       <div class="watcher-actions">
         <button class="icon-btn" title="Build Cart Now" onclick="buildCart('${w.id}')">🛒</button>

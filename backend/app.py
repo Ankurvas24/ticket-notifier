@@ -442,7 +442,12 @@ def apply_check_result(watcher, result):
     prev_status = watcher.get("last_status")
 
     if result.get("name") and watcher.get("name") in ("", "Checking\u2026", "Checking...", None):
-        watcher["name"] = result["name"]
+        # Never allow obvious junk (bot-challenge titles) to become the name
+        candidate = result["name"].strip()
+        junk = {"just a moment", "just a moment...", "home", "bookmyshow",
+                "district", "loading", "access denied", "checking your browser"}
+        if candidate and candidate.lower() not in junk:
+            watcher["name"] = candidate
 
     # CRITICAL: never let "unknown"/"error" results overwrite a known status
     # or trigger alerts. A fetch failure is NOT availability.
@@ -451,9 +456,27 @@ def apply_check_result(watcher, result):
             "last_checked_ts": time.time(),
             "last_checked":    datetime.now().isoformat(),
         })
+        # Surface bot-challenge / proxy-auth issues to the UI so the user
+        # knows WHY we're not getting through (instead of seeing a silent
+        # "Checking..." forever).
+        err_kind = result.get("error") or ""
+        detail = result.get("detail") or ""
+        if err_kind == "bot_challenge":
+            watcher["last_error"] = (
+                "Bot-check blocked (Cloudflare/Akamai). "
+                "Residential proxy is down or IP is flagged."
+            )
+        elif err_kind == "redirected_to_landing":
+            watcher["last_error"] = "Redirected to landing page (site blocking datacenter IP)."
+        elif detail:
+            watcher["last_error"] = detail[:180]
         # Keep last_status as-is (don't flip from available→unknown on a
         # transient network blip). No alert.
         return watcher
+
+    # Clear last_error on successful check
+    if "last_error" in watcher:
+        watcher.pop("last_error", None)
 
     watcher.update({
         "last_status":    status,

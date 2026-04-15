@@ -278,10 +278,24 @@ def _check_bms_api(url: str, use_proxy: bool = False) -> Optional[dict]:
             return None  # inconclusive — let other methods try
 
         except requests.exceptions.ProxyError as e:
-            logger.warning(f"BMS API proxy error: {e}")
-            if use_proxy:
-                _proxy_failure()
-            return None  # fail fast on proxy errors
+            err_str = str(e)
+            if "407" in err_str or "authentication required" in err_str.lower():
+                logger.error(
+                    "🚫 PROXY 407 AUTH FAILURE — Decodo credentials are wrong/"
+                    "expired or bandwidth exhausted. Set PROXY_USERNAME/"
+                    "PROXY_PASSWORD correctly or unset all PROXY_* env vars to "
+                    "bypass the proxy. Tripping circuit breaker."
+                )
+                # Trip the breaker hard — not just one failure
+                if use_proxy:
+                    _proxy_failure()
+                    _proxy_failure()
+                    _proxy_failure()
+            else:
+                logger.warning(f"BMS API proxy error: {e}")
+                if use_proxy:
+                    _proxy_failure()
+            return None
         except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             logger.debug(f"BMS API failed for {api_url[:60]}: {e}")
             continue
@@ -341,13 +355,39 @@ def _parse_html(html: str, url: str) -> dict:
 
     text = soup.get_text(" ", strip=True).lower()
 
+    # ── Detect Cloudflare/Akamai bot-challenge pages ──────────────────────
+    # Titles like "Just a moment...", "Access denied", "One moment, please..."
+    # indicate we were served the bot-check, NOT the event page. We must
+    # return "unknown" (not parse this as the event) so the UI shows the
+    # real blocked state instead of overwriting the watcher name with junk.
+    BOT_CHALLENGE_TITLES = (
+        "just a moment", "just a moment...", "checking your browser",
+        "attention required", "access denied", "one moment, please",
+        "cloudflare", "please enable cookies", "request unsuccessful",
+        "bot detection", "security check", "ddos protection",
+    )
+
     # Extract event name from <title>
     name = ""
     title_tag = soup.find("title")
+    raw_title = ""
     if title_tag:
         raw_title = title_tag.get_text(strip=True)
+        if any(marker in raw_title.lower() for marker in BOT_CHALLENGE_TITLES):
+            logger.warning(
+                f"🚫 Bot-challenge page detected for {url[:60]} "
+                f"(title: {raw_title!r}) — proxy/IP needs fixing"
+            )
+            return {"status": "unknown", "name": "",  # don't overwrite watcher
+                    "price": "", "error": "bot_challenge",
+                    "detail": f"Cloudflare/Akamai served challenge page: {raw_title[:80]}"}
         # Remove " - BookMyShow" suffix and similar
         name = re.split(r"\s*[\|–—]\s*", raw_title)[0].strip()
+        # Final safety: if somehow the name still ends up looking like junk,
+        # drop it rather than corrupt the watcher card
+        if name.lower() in {"just a moment", "home", "", "bookmyshow",
+                            "district", "loading"}:
+            name = ""
 
     # Extract price
     price = ""
@@ -433,9 +473,18 @@ def _fetch_with_requests(url: str, use_proxy: bool = False) -> Optional[str]:
             _proxy_success()
         return resp.text
     except requests.exceptions.ProxyError as e:
-        logger.warning(f"Requests proxy error for {url[:60]}: {e}")
-        if use_proxy:
-            _proxy_failure()
+        err_str = str(e)
+        if "407" in err_str or "authentication required" in err_str.lower():
+            logger.error(
+                "🚫 PROXY 407 on HTML fetch — Decodo auth failing. "
+                "Check PROXY_USERNAME/PROXY_PASSWORD in Railway env vars."
+            )
+            if use_proxy:
+                _proxy_failure(); _proxy_failure(); _proxy_failure()
+        else:
+            logger.warning(f"Requests proxy error for {url[:60]}: {e}")
+            if use_proxy:
+                _proxy_failure()
         return None
     except Exception as e:
         logger.warning(f"Requests fetch failed for {url[:80]}: {e}")
@@ -689,6 +738,19 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
                     f"Scraper (playwright): {result['status']} for {url[:60]} "
                     f"in {elapsed:.1f}s"
                 )
+                # If Playwright returned "unknown" with no specific error,
+                # and the proxy is dead, the real reason is usually the
+                # bot-check. Flag it so the UI shows the real cause.
+                if (result.get("status") == "unknown"
+                        and not result.get("error")
+                        and not _proxy_is_healthy()):
+                    result["error"] = "bot_challenge"
+                    result["detail"] = (
+                        "Proxy is down (407/dead). Railway's datacenter IP "
+                        "is being bot-challenged by BookMyShow/Akamai. Fix "
+                        "PROXY_USERNAME/PROXY_PASSWORD or use a residential "
+                        "proxy."
+                    )
                 return result
         except Exception as e:
             logger.warning(f"Playwright failed: {e}")
@@ -696,7 +758,12 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
     # ── All methods exhausted ────────────────────────────────────────────
     elapsed = time.time() - start_time
     logger.error(f"All methods failed for {url[:60]} in {elapsed:.1f}s")
+    err = "All fetch methods failed"
+    detail = ""
+    if not _proxy_is_healthy():
+        err = "bot_challenge"
+        detail = "Proxy is down and BMS/Akamai blocks datacenter IPs."
     return {
         "status": "error", "name": "", "price": "",
-        "error": "All fetch methods failed",
+        "error": err, "detail": detail,
     }
