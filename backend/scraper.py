@@ -354,6 +354,31 @@ def _parse_html(html: str, url: str) -> dict:
         return {"status": "unknown", "name": "", "price": "",
                 "error": "redirected_to_landing"}
 
+    # ── RAW HTML REGEX FAST-PATH ──────────────────────────────────────
+    # Before BS4 parsing, do a case-insensitive regex scan of raw HTML
+    # for high-confidence signals. This catches cases where a button's
+    # text is inside nested DOM that BS4.get_text() may strip weirdly.
+    lowered_html = html.lower()
+    # Sold-out takes priority over Book Now (don't alert if seat map is over)
+    if re.search(r"\bsold\s*out\b", lowered_html) and \
+       not re.search(r"\bbook\s*now\b", lowered_html):
+        logger.info(f"🎯 Raw-HTML match: SOLD OUT for {url[:60]}")
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        nm = m.group(1).split("|")[0].strip() if m else ""
+        return {"status": "sold_out", "name": nm, "price": ""}
+    # Book Now / Buy Now — strong positive signal in raw HTML
+    if (re.search(r"\bbook\s*now\b", lowered_html)
+            or re.search(r"\bbuy\s*tickets\b", lowered_html)
+            or re.search(r"\bget\s*tickets\b", lowered_html)):
+        logger.info(f"🎯 Raw-HTML match: BOOK NOW visible for {url[:60]}")
+        # Extract title
+        m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+        nm = m.group(1).split("|")[0].strip() if m else ""
+        # Extract price (₹XXXX onwards)
+        pm = re.search(r"₹\s*[\d,]+\s*onwards", html)
+        pr = pm.group(0) if pm else ""
+        return {"status": "available", "name": nm, "price": pr}
+
     soup = BeautifulSoup(html, "lxml")
 
     for tag in soup(["script", "style", "noscript"]):
@@ -639,6 +664,30 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
             await asyncio.sleep(random.uniform(0.3, 0.8))
 
+            # ── WAIT FOR BOOK NOW / SOLD OUT BUTTON TO RENDER ────────
+            # BMS renders the price sidebar + Book Now button via JS
+            # AFTER initial page load. If we grab HTML before it renders,
+            # we miss the signal. Wait up to 8s for ANY availability
+            # marker to appear. If none appear in time, we proceed with
+            # what we have and return "unknown".
+            try:
+                await page.wait_for_selector(
+                    "button:has-text('Book Now'), "
+                    "button:has-text('Buy Tickets'), "
+                    "button:has-text('Get Tickets'), "
+                    "button:has-text('Sold Out'), "
+                    "[class*='book-button'], "
+                    "text=/book now/i, "
+                    "text=/sold out/i, "
+                    "text=/coming soon/i, "
+                    "text=/notify me/i",
+                    timeout=8_000,
+                )
+            except PWTimeout:
+                pass
+            except Exception:
+                pass
+
             # ── DETECT REDIRECT TO LANDING PAGE ─────────────────────
             # If we navigated to /cinemas /movies /home etc., bail out —
             # don't report "available" based on generic landing HTML.
@@ -706,6 +755,13 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
     No retries for API checks (they either work or don't).
     Single retry for HTML checks with short backoff.
     """
+    # ── Clean URL: BMS's ?data=groupPage parameter makes them serve a
+    # stripped-down JSON-ish page instead of the real event HTML with
+    # the Book Now sidebar. Strip it so Playwright gets the real page.
+    if "?data=" in url:
+        url = url.split("?data=")[0]
+        logger.info(f"Stripped ?data= param from URL for scraping: {url[:80]}")
+
     is_bms = "bookmyshow.com" in url.lower()
     start_time = time.time()
 
