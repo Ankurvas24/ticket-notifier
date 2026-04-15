@@ -1526,13 +1526,38 @@ _VALID_CART_TOKENS = (
 
 
 async def _capture_cookies_safely(ctx, session_id: str) -> dict:
-    """Capture Playwright session cookies safely."""
+    """
+    Capture Playwright session cookies safely.
+    Logs name+domain (NOT values) to Railway so user can confirm capture.
+    """
     try:
         raw = await ctx.cookies()
+        if not raw:
+            logger.warning(f"[{session_id}] Cookie capture returned 0 cookies")
+            return {"raw": [], "editthiscookie": [], "ok": False}
+
+        # Group by domain for a tidy summary
+        by_domain = {}
+        for c in raw:
+            d = c.get("domain", "?")
+            by_domain.setdefault(d, []).append(c.get("name", "?"))
+        summary = "; ".join(f"{d}={len(ns)}" for d, ns in by_domain.items())
+        logger.info(
+            f"[{session_id}] 🎟️ CAPTURED {len(raw)} session cookies → {summary}"
+        )
+        # Also log names of key bot-gate cookies so user can confirm
+        key_names = [c.get("name", "") for c in raw
+                     if any(k in (c.get("name") or "").lower()
+                            for k in ["_abck", "bm_sz", "bm_sv", "ak_bmsc",
+                                      "sess", "auth", "jsessionid", "__cf",
+                                      "cart", "queue"])]
+        if key_names:
+            logger.info(f"[{session_id}] 🔑 KEY cookies present: {key_names}")
+
         return {
-            "raw": raw,
+            "raw":            raw,
             "editthiscookie": _to_editthiscookie_format(raw),
-            "ok": True
+            "ok":             True,
         }
     except Exception as e:
         logger.error(f"[{session_id}] cookie capture failed: {e}")

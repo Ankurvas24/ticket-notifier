@@ -712,6 +712,10 @@ def check_now(watcher_id):
 
 @app.route("/api/watchers/<watcher_id>/build-cart", methods=["POST"])
 def build_cart(watcher_id):
+    """
+    Manually (re-)trigger the cart build — useful when the first attempt
+    selected 0 seats, or the user wants to capture fresh session cookies.
+    """
     if not _validate_watcher_id(watcher_id):
         return jsonify({"error": "Invalid watcher ID"}), 400
     with _data_lock:
@@ -721,6 +725,21 @@ def build_cart(watcher_id):
             return jsonify({"error": "Not found"}), 404
         if not _owns_watcher(watcher):
             return jsonify({"error": "Not authorized"}), 403
+
+    # Clear any existing session so trigger won't skip it
+    try:
+        _autocheckout_mod._sessions_lock.acquire()
+        sid = f"{watcher_id}-cart"
+        if sid in _autocheckout_mod._sessions:
+            del _autocheckout_mod._sessions[sid]
+            logger.info(f"build-cart: cleared existing session for {watcher_id}")
+    except Exception as e:
+        logger.warning(f"build-cart: could not clear session: {e}")
+    finally:
+        try:
+            _autocheckout_mod._sessions_lock.release()
+        except Exception:
+            pass
 
     checkout_url = watcher.get("checkout_url") or _derive_checkout_url(watcher["url"])
     trigger_auto_checkout(

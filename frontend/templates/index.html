@@ -766,16 +766,22 @@
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="alert-btn secondary" onclick="copyCartCookies()"
-                  style="flex:1; min-width:140px;">
+                  style="flex:1; min-width:120px;">
             📋 Copy Session
           </button>
+          <button class="alert-btn secondary" onclick="retryCartBuild()"
+                  style="flex:1; min-width:120px;">
+            🔄 Retry Cart
+          </button>
           <button class="alert-btn secondary" onclick="showCookieInstructions()"
-                  style="flex:1; min-width:140px;">
+                  style="flex:1; min-width:120px;">
             ❓ How to Use
           </button>
         </div>
         <div id="cookie-status" style="font-size:11px; color:#aaffcc;
              margin-top:6px; text-align:center;"></div>
+        <div id="cookie-count" style="font-size:10px; color:#ffcc00;
+             margin-top:4px; text-align:center; opacity:.85;"></div>
       </div>
     </div>
 
@@ -1400,6 +1406,8 @@
     if (fb) fb.remove();
     const cs = document.getElementById('cookie-status');
     if (cs) cs.textContent = '';
+    const cc = document.getElementById('cookie-count');
+    if (cc) cc.textContent = '';
   }
 
   // Track which watcher's cookies we can copy (set when cart_ready fires)
@@ -1466,6 +1474,48 @@
     document.getElementById('cookie-modal').style.display = 'none';
   }
 
+  // Manually re-trigger the cart build (retry when first attempt selected 0 seats
+  // or to refresh the session cookies)
+  async function retryCartBuild() {
+    const statusEl = document.getElementById('cookie-status');
+    if (!_cookieWatcherId) {
+      statusEl.textContent = 'No active watcher.';
+      return;
+    }
+    statusEl.textContent = '🔄 Retrying cart build — this may take 30–60s…';
+    document.getElementById('cookie-count').textContent = '';
+    try {
+      const res = await fetch(`/api/watchers/${_cookieWatcherId}/build-cart`,
+                              { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        statusEl.textContent = '✅ Retry queued. Polling for new cart…';
+        // Restart the poll so the UI shows progress
+        _startCartPoll(_cookieWatcherId);
+      } else {
+        statusEl.textContent = `❌ ${data.error || 'Retry failed'}`;
+      }
+    } catch (e) {
+      statusEl.textContent = '❌ Network error — try again.';
+    }
+  }
+
+  // When cart_ready fires, fetch and display the cookie count
+  async function _refreshCookieCount(watcherId) {
+    try {
+      const res = await fetch(`/api/watchers/${watcherId}/cookies`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const n = (data.editthiscookie || []).length;
+      const countEl = document.getElementById('cookie-count');
+      if (countEl) {
+        countEl.textContent = n > 0
+          ? `🎟️ ${n} session cookies captured — click Copy Session to transfer.`
+          : '⚠️ No cookies captured yet. Tap Retry Cart.';
+      }
+    } catch (e) { /* silent */ }
+  }
+
   // Poll /api/cart-status/<watcher_id> every 2 s — cart-only mode
   function _startCartPoll(watcherId) {
     if (_otpPollTimer) clearInterval(_otpPollTimer);
@@ -1523,6 +1573,8 @@
           playAlarmSound();
           clearInterval(_otpPollTimer);
           showToast('Cart ready! Tap to pay.', 'success');
+          // Refresh cookie count in the banner
+          _refreshCookieCount(watcherId);
         } else if (data.status === 'failed') {
           document.getElementById('cart-section').style.display = 'none';
           document.getElementById('alert-body').textContent =
