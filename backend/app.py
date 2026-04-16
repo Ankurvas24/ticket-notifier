@@ -1038,6 +1038,14 @@ def bms_session_status():
 
 @app.route("/health")
 def health():
+    """
+    Liveness probe for Railway / uptime monitors.
+
+    Returns 200 as long as the Flask worker is responsive, even if the
+    background monitor thread or the database is temporarily degraded —
+    that way a transient wobble can't kill a deploy. Use the response
+    body to see the actual state of each subsystem.
+    """
     db_ok = True
     if DATABASE_URL:
         try:
@@ -1053,7 +1061,7 @@ def health():
         "ts": datetime.now().isoformat(),
         "database": "connected" if db_ok else "error",
         "monitor": "running" if monitor_ok else "stopped",
-    }), 200 if status == "ok" else 503
+    }), 200
 
 @app.errorhandler(404)
 def not_found(e):

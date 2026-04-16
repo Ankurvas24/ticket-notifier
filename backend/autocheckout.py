@@ -53,7 +53,6 @@ from typing import Optional
 
 from playwright.async_api import Error as PlaywrightError
 
-from . import config
 from . import cookie_manager
 
 logger = logging.getLogger("ticketalert.checkout")
