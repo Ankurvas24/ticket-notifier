@@ -31,6 +31,8 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
+from . import cookie_manager
+
 logger = logging.getLogger("ticketalert.scraper")
 
 # ── Proxy config (same env vars as autocheckout.py) ──────────────────────────
