@@ -755,18 +755,25 @@ async def _bms_handle_contact_details(page, session_id: str, owner_email: str):
         if email_inputs:
             for inp in email_inputs:
                 if await inp.is_visible(timeout=1000):
-                    email_to_use = owner_email or "ankurvashishtha8535@gmail.com"
+                    email_to_use = owner_email or os.environ.get("ALERT_EMAIL", "")
+                    if not email_to_use:
+                        logger.warning(f"[{session_id}] No email available for contact form — skipping")
+                        break
                     await inp.fill(email_to_use)
                     logger.info(f"[{session_id}] Filled email: {email_to_use}")
                     break
-                    
+
         phone_inputs = await page.locator("input[type='tel'], input[name*='phone' i], input[name*='mobile' i], input[placeholder*='Mobile' i]").all()
-        if phone_inputs:
+        # Use the configured alert phone (strip +91 prefix for 10-digit field)
+        _raw_phone = os.environ.get("ALERT_PHONE", "")
+        _phone_digits = re.sub(r"[^\d]", "", _raw_phone)
+        if _phone_digits.startswith("91") and len(_phone_digits) == 12:
+            _phone_digits = _phone_digits[2:]  # strip country code
+        if phone_inputs and _phone_digits:
             for inp in phone_inputs:
                 if await inp.is_visible(timeout=1000):
-                    # Usually just the 10-digit number is required
-                    await inp.fill("8368272979")
-                    logger.info(f"[{session_id}] Filled phone number: 8368272979")
+                    await inp.fill(_phone_digits)
+                    logger.info(f"[{session_id}] Filled phone number: {_phone_digits}")
                     break
 
         # Check for T&C checkboxes that might need checking

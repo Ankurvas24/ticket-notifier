@@ -844,39 +844,61 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
             logger.debug(f"Proxy requests failed: {e}")
 
     # ── Strategy 5: Playwright (heavy, slow — last resort) ───────────────
+    # Retry once on bot-challenge / unknown (CF sometimes needs a second
+    # attempt after the proxy IP warms up and earns clearance).
     if use_browser:
-        try:
+        _pw_max_attempts = 2
+        for _pw_attempt in range(1, _pw_max_attempts + 1):
             try:
-                html = asyncio.run(_fetch_with_playwright(url))
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                html = loop.run_until_complete(_fetch_with_playwright(url))
-                loop.close()
+                try:
+                    html = asyncio.run(_fetch_with_playwright(url))
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    html = loop.run_until_complete(_fetch_with_playwright(url))
+                    loop.close()
 
-            if html:
-                result = _parse_html(html, url)
-                elapsed = time.time() - start_time
-                logger.info(
-                    f"Scraper (playwright): {result['status']} for {url[:60]} "
-                    f"in {elapsed:.1f}s"
-                )
-                # If Playwright returned "unknown" with no specific error,
-                # and the proxy is dead, the real reason is usually the
-                # bot-check. Flag it so the UI shows the real cause.
-                if (result.get("status") == "unknown"
-                        and not result.get("error")
-                        and not _proxy_is_healthy()):
-                    result["error"] = "bot_challenge"
-                    result["detail"] = (
-                        "Proxy is down (407/dead). Railway's datacenter IP "
-                        "is being bot-challenged by BookMyShow/Akamai. Fix "
-                        "PROXY_USERNAME/PROXY_PASSWORD or use a residential "
-                        "proxy."
+                if html:
+                    result = _parse_html(html, url)
+                    elapsed = time.time() - start_time
+
+                    # If we got a bot-challenge or unknown on the first attempt,
+                    # retry once — CF often lets the second request through after
+                    # the proxy IP has earned cf_clearance from the first visit.
+                    if (_pw_attempt < _pw_max_attempts
+                            and result.get("status") in ("unknown",)
+                            and result.get("error") in ("bot_challenge", None)):
+                        logger.info(
+                            f"Playwright attempt {_pw_attempt}: got {result.get('status')}"
+                            f"/{result.get('error')} — retrying after short delay"
+                        )
+                        time.sleep(random.uniform(2.0, 4.0))
+                        continue
+
+                    logger.info(
+                        f"Scraper (playwright, attempt {_pw_attempt}): "
+                        f"{result['status']} for {url[:60]} in {elapsed:.1f}s"
                     )
-                return result
-        except Exception as e:
-            logger.warning(f"Playwright failed: {e}")
+                    # If Playwright returned "unknown" with no specific error,
+                    # and the proxy is dead, the real reason is usually the
+                    # bot-check. Flag it so the UI shows the real cause.
+                    if (result.get("status") == "unknown"
+                            and not result.get("error")
+                            and not _proxy_is_healthy()):
+                        result["error"] = "bot_challenge"
+                        result["detail"] = (
+                            "Proxy is down (407/dead). Railway's datacenter IP "
+                            "is being bot-challenged by BookMyShow/Akamai. Fix "
+                            "PROXY_USERNAME/PROXY_PASSWORD or use a residential "
+                            "proxy."
+                        )
+                    return result
+            except Exception as e:
+                logger.warning(f"Playwright failed (attempt {_pw_attempt}): {e}")
+                if _pw_attempt < _pw_max_attempts:
+                    time.sleep(random.uniform(1.5, 3.0))
+                    continue
+                break
 
     # ── If Playwright failed but requests-via-proxy gave us SOMETHING,
     #    use that rather than saying "error". Still an "unknown" but at

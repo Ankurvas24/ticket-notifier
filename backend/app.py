@@ -958,7 +958,8 @@ def get_watcher_cookies(watcher_id):
 
 def _send_cart_notification(watcher, cart_url):
     """Push + SMS + email to the watcher owner when their cart is ready."""
-    data = load_data()
+    with _data_lock:
+        data = load_data()
     payload = {
         "type":              "CART_READY",
         "title":             "TICKETS LIVE - Book Now!",

@@ -277,8 +277,12 @@ async def inject_cookies_if_exist(context, session_id: str = "scraper") -> bool:
 
 
 def have_user_cookies() -> bool:
-    """Quick check — returns True if bms_cookies.json is present and non-empty."""
+    """Quick check — returns True if BMS cookies are available (env var OR file)."""
     try:
+        # Check env var first (production / Railway)
+        if os.environ.get("BMS_COOKIES_RAW", "").strip():
+            return True
+        # Fall back to file on disk (local dev)
         return os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 10
     except Exception:
         return False
