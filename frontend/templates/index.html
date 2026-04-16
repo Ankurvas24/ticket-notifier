@@ -611,6 +611,12 @@
   </header>
 
   <main>
+    <!-- BMS bot-session banner (populated on load) -->
+    <div id="bms-session-banner" style="display:none; margin:0 auto 18px;
+         max-width:820px; padding:10px 14px; border-radius:10px;
+         border:1px solid rgba(76,217,100,.35); background:rgba(76,217,100,.08);
+         color:#9de7b3; font-size:13px; line-height:1.45; text-align:center;"></div>
+
     <div class="hero">
       <h1>
         Get <span class="accent">alarm</span> alerts<br>
@@ -755,32 +761,29 @@
         ⚡ Opens seat selection directly - be fast!
       </div>
 
-      <!-- Session hijack — transfer the bot's cookies to your browser -->
+      <!-- Logged-in mode info — the bot carries YOUR BMS session -->
       <div id="session-transfer" style="margin-top:10px; padding:10px; border-radius:8px;
-           background:rgba(255,255,255,.06); border:1px solid rgba(255,204,0,.35);">
-        <div style="font-size:12px; color:#ffe680; font-weight:700; margin-bottom:6px;">
-          🔑 Getting kicked back to /cinemas?
+           background:rgba(76,217,100,.08); border:1px solid rgba(76,217,100,.35);">
+        <div style="font-size:12px; color:#aaffcc; font-weight:700; margin-bottom:6px;">
+          ✅ Bot runs with your BMS login
         </div>
-        <div style="font-size:11px; color:#ffe6a8; line-height:1.4; margin-bottom:8px;">
-          The bot holds the session that owns your cart. Transfer it to your browser:
+        <div style="font-size:11px; color:#cfeedd; line-height:1.4; margin-bottom:8px;">
+          The cart URL above is already tied to your BookMyShow account — just tap
+          <b>Book Tickets Now</b> and pay. No cookie copying needed.
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
-          <button class="alert-btn secondary" onclick="copyCartCookies()"
-                  style="flex:1; min-width:120px;">
-            📋 Copy Session
-          </button>
           <button class="alert-btn secondary" onclick="retryCartBuild()"
                   style="flex:1; min-width:120px;">
-            🔄 Retry Cart
+            🔄 Rebuild Cart
           </button>
           <button class="alert-btn secondary" onclick="showCookieInstructions()"
                   style="flex:1; min-width:120px;">
-            ❓ How to Use
+            ❓ Something's off?
           </button>
         </div>
         <div id="cookie-status" style="font-size:11px; color:#aaffcc;
              margin-top:6px; text-align:center;"></div>
-        <div id="cookie-count" style="font-size:10px; color:#ffcc00;
+        <div id="cookie-count" style="font-size:10px; color:#88cc99;
              margin-top:4px; text-align:center; opacity:.85;"></div>
       </div>
     </div>
@@ -798,26 +801,48 @@
          background:#1a1a2e; border-radius:14px; padding:22px; color:#fff;
          box-shadow:0 20px 60px rgba(0,0,0,.6);">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-        <h3 style="margin:0; font-size:18px;">🔑 Transfer Bot Session to Your Browser</h3>
+        <h3 style="margin:0; font-size:18px;">🎟️ How the cart link works</h3>
         <button onclick="hideCookieInstructions()"
                 style="background:none; border:none; color:#fff; font-size:22px;
                        cursor:pointer; padding:0 6px;">×</button>
       </div>
-      <ol style="font-size:13px; line-height:1.6; padding-left:18px; color:#ddd;">
-        <li>Install <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm"
-               target="_blank" style="color:#a855f7;">Cookie-Editor</a>
-               (Chrome/Edge/Firefox) or <a
-               href="https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg"
-               target="_blank" style="color:#a855f7;">EditThisCookie</a>.</li>
-        <li>Tap <b>📋 Copy Session</b> in the alert above — this copies the bot's wristband to your clipboard.</li>
-        <li>Open the cart link in a new tab (it'll bounce you to /cinemas — that's fine).</li>
-        <li>Click the Cookie-Editor icon → <b>Import</b> → paste → <b>Save</b>.</li>
-        <li>Refresh the page. You now hold the bot's session — go straight to checkout.</li>
-      </ol>
+      <div style="font-size:13px; line-height:1.55; color:#ddd;">
+        <p style="margin:0 0 10px;">
+          The bot is logged into <b>your</b> BookMyShow account (via the
+          <code style="background:#333;padding:1px 4px;border-radius:3px;">bms_cookies.json</code>
+          file you pasted into the project folder). When tickets drop, it locks
+          seats on your behalf and hands you a cart URL that's already tied to
+          your account.
+        </p>
+        <p style="margin:0 0 10px;">
+          <b>Best way to check out:</b>
+        </p>
+        <ol style="padding-left:18px; margin:0 0 10px;">
+          <li>Make sure you're signed into BookMyShow in your normal browser.</li>
+          <li>Tap the push notification (or the <b>Book Tickets Now</b> button above).</li>
+          <li>The cart link opens in your browser with seats already in your cart.</li>
+          <li>Pick payment → pay. Done.</li>
+        </ol>
+        <p style="margin:0 0 6px;"><b>If the page bounces to /cinemas:</b></p>
+        <ul style="padding-left:18px; margin:0;">
+          <li>Tap <b>🔄 Rebuild Cart</b> above — the bot will re-lock seats.</li>
+          <li>Or copy the cart URL and paste it while you're actively signed in.</li>
+          <li>Last resort: tap <b>📋 Copy Session</b> (advanced — only works if your
+              IP matches the bot's proxy IP, which is rare).</li>
+        </ul>
+        <div style="margin-top:10px;">
+          <button class="alert-btn secondary" onclick="copyCartCookies()"
+                  style="width:100%; font-size:11px;">
+            📋 Advanced: Copy Bot Session Cookies
+          </button>
+        </div>
+      </div>
       <div style="font-size:11px; color:#888; margin-top:14px; padding-top:12px;
            border-top:1px solid #333;">
-        Cookies expire quickly, so paste and pay fast. If the page still bounces,
-        tap Copy Session again — the bot may have updated the wristband.
+        Your BMS login is stored only on the bot's server — it's not shared with
+        anyone else. To refresh the stored session, replace
+        <code style="background:#333;padding:1px 4px;border-radius:3px;">bms_cookies.json</code>
+        with a fresh cookie export and redeploy.
       </div>
     </div>
   </div>
@@ -858,7 +883,38 @@
     if (p.get('auth') === 'success') showToast('Signed in with Google!', 'success');
     if (p.get('auth') === 'error')   showToast('Google sign-in failed', 'error');
     if (p.has('auth')) history.replaceState({}, '', '/');
+
+    // Report whether the bot has a stored BMS login session
+    _refreshBmsSessionBanner();
   })();
+
+  // ── BMS bot-session banner ────────────────────────────────────────────────────
+  async function _refreshBmsSessionBanner() {
+    const el = document.getElementById('bms-session-banner');
+    if (!el) return;
+    try {
+      const res  = await fetch('/api/bms-session-status');
+      const info = await res.json();
+      if (info && info.logged_in) {
+        const who = info.name
+          ? `<b>${info.name}${info.last_name ? ' ' + info.last_name : ''}</b>`
+                + (info.email ? ` &lt;${info.email}&gt;` : '')
+          : '<b>your BMS account</b>';
+        el.innerHTML = `✅ Bot is signed into BookMyShow as ${who}. ` +
+          `Cart links will be tied to this account — just tap the notification and pay.`;
+        el.style.display = 'block';
+      } else {
+        el.style.background = 'rgba(255,204,0,.08)';
+        el.style.borderColor = 'rgba(255,204,0,.35)';
+        el.style.color = '#ffe680';
+        el.innerHTML = `⚠️ No BMS login found on the server. ` +
+          `Paste your BookMyShow cookies into <code>bms_cookies.json</code> so the bot can build carts tied to your account.`;
+        el.style.display = 'block';
+      }
+    } catch (e) {
+      // Silent — banner just won't appear
+    }
+  }
 
   // ── Utilities ───────────────────────────────────────────────────────────────
   function urlB64ToUint8Array(base64String) {
@@ -1516,8 +1572,8 @@
       const countEl = document.getElementById('cookie-count');
       if (countEl) {
         countEl.textContent = n > 0
-          ? `🎟️ ${n} session cookies captured — click Copy Session to transfer.`
-          : '⚠️ No cookies captured yet. Tap Retry Cart.';
+          ? `🎟️ ${n} session cookies captured (cart is tied to your BMS login).`
+          : '⚠️ Cart URL ready, but no cookies captured. Tap Rebuild Cart if the link bounces.';
       }
     } catch (e) { /* silent */ }
   }

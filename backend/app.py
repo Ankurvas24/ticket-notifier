@@ -986,6 +986,56 @@ def _send_cart_notification(watcher, cart_url):
                      daemon=True).start()
 
 
+@app.route("/api/bms-session-status")
+def bms_session_status():
+    """
+    Report whether the bot has a stored BMS login session (bms_cookies.json)
+    and, if so, who the bot is signed in as.
+
+    The frontend uses this to display a banner like
+    "✅ Bot signed in as Ankur (ankurvashishtha8535@gmail.com)".
+    """
+    from . import cookie_manager as _cm
+    try:
+        raw = _cm._load_raw()
+    except Exception as e:
+        logger.warning(f"bms_session_status: could not load cookies: {e}")
+        return jsonify({"logged_in": False, "reason": "load_failed"})
+
+    if not raw:
+        return jsonify({"logged_in": False, "reason": "no_cookies_file"})
+
+    # Pull identity from 'ud' cookie (JSON-encoded user data)
+    ud_raw = next((c.get("value") for c in raw if c.get("name") == "ud"), None)
+    has_bmsid = any(c.get("name") == "bmsId" for c in raw)
+
+    info = {
+        "logged_in": bool(ud_raw or has_bmsid),
+        "has_bmsid": has_bmsid,
+        "cookie_count": len(raw),
+    }
+
+    if ud_raw:
+        try:
+            # 'ud' is URL-encoded JSON
+            from urllib.parse import unquote
+            decoded = unquote(ud_raw)
+            parsed = json.loads(decoded)
+            info.update({
+                "name": parsed.get("NAME") or parsed.get("FIRSTNAME") or "",
+                "last_name": parsed.get("LASTNAME", ""),
+                "email": parsed.get("MEMBEREMAIL", ""),
+                "member_id": parsed.get("MEMBERID", ""),
+                "is_plus": parsed.get("ISPLUSLOGIN") == "Y",
+                "mobile_verified": parsed.get("OTPMOBVERIFIED") == "Y",
+                "email_verified": parsed.get("EMAILVERIFIED") == "Y",
+            })
+        except Exception as e:
+            logger.debug(f"Failed to parse 'ud' cookie: {e}")
+
+    return jsonify(info)
+
+
 @app.route("/health")
 def health():
     db_ok = True

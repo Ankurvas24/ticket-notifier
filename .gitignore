@@ -9,3 +9,8 @@ _push.bat
 _check.bat
 git_output.log
 check.log
+
+# User's BookMyShow session cookies — NEVER commit. Bot loads at runtime.
+bms_cookies.json
+*.cookies.json
+cookies.json

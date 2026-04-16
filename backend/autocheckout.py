@@ -1447,15 +1447,23 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             # /buytickets/ET... triggers the "suspicious entry" heuristic
             # and gets the session killed before we can see seats.
             try:
-                if has_custom_cookies:
-                    logger.info(f"[{session_id}] Custom session loaded — skipping Akamai warmup")
-                    warmup_url = None
-                elif is_bms:
+                # IMPORTANT: even if we injected the user's BMS auth cookies,
+                # we ALWAYS run warmup. The user's CF/Akamai cookies are
+                # IP-bound and were stripped by cookie_manager — the bot
+                # still needs to earn fresh CF clearance on its proxy IP
+                # before BMS will serve the event page. Auth cookies
+                # (bmsId, ud) layer on top of that fresh CF session.
+                if is_bms:
                     warmup_url = "https://in.bookmyshow.com/"
                 elif is_district:
                     warmup_url = "https://www.district.in/"
                 else:
                     warmup_url = None
+                if has_custom_cookies and warmup_url:
+                    logger.info(
+                        f"[{session_id}] Custom BMS session present — running warmup "
+                        f"anyway to earn fresh CF clearance on proxy IP"
+                    )
 
                 if warmup_url:
                     _update(session_id, message="Warming up session (Akamai handshake)...")
