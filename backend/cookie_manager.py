@@ -93,16 +93,36 @@ def _parse_cookie_header(raw: str) -> List[Dict[str, Any]]:
 
 
 def _load_raw() -> List[Dict[str, Any]]:
-    """Read bms_cookies.json and return a list of {name,value,...} dicts."""
-    if not os.path.isfile(COOKIES_FILE):
-        return []
+    """
+    Load the user's BMS login session from (in priority order):
 
-    try:
-        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-    except Exception as e:
-        logger.error(f"Failed to read {COOKIES_FILE}: {e}")
-        return []
+    1. The `BMS_COOKIES_RAW` environment variable — used in production
+       (Railway/Heroku/etc.) where the cookies file is gitignored and
+       therefore not present in the deployed container. Paste the
+       Cookie-header string or JSON array as the env var value.
+    2. The `bms_cookies.json` file in the project root — used in local
+       development. Same two formats accepted.
+
+    Returns a list of {name, value, ...} dicts, or [] if nothing is set.
+    """
+    text = ""
+    source = ""
+
+    # 1. Env-var first (production)
+    env_raw = os.environ.get("BMS_COOKIES_RAW", "").strip()
+    if env_raw:
+        text = env_raw
+        source = "BMS_COOKIES_RAW env var"
+
+    # 2. Fall back to the file on disk (local dev)
+    if not text and os.path.isfile(COOKIES_FILE):
+        try:
+            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            source = f"{os.path.basename(COOKIES_FILE)}"
+        except Exception as e:
+            logger.error(f"Failed to read {COOKIES_FILE}: {e}")
+            return []
 
     if not text:
         return []
@@ -111,16 +131,22 @@ def _load_raw() -> List[Dict[str, Any]]:
     if text.startswith("[") or text.startswith("{"):
         try:
             data = json.loads(text)
+            parsed: List[Dict[str, Any]]
             if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                # Flatten {name: value, ...} → list
-                return [{"name": k, "value": v} for k, v in data.items()]
+                parsed = data
+            elif isinstance(data, dict):
+                parsed = [{"name": k, "value": v} for k, v in data.items()]
+            else:
+                parsed = []
+            logger.info(f"🔐 Loaded {len(parsed)} BMS cookies from {source} (JSON format)")
+            return parsed
         except Exception as e:
-            logger.warning(f"bms_cookies.json looked like JSON but failed to parse: {e}")
+            logger.warning(f"{source} looked like JSON but failed to parse: {e}")
 
     # Fall back to raw Cookie-header string
-    return _parse_cookie_header(text)
+    parsed = _parse_cookie_header(text)
+    logger.info(f"🔐 Loaded {len(parsed)} BMS cookies from {source} (Cookie-header format)")
+    return parsed
 
 
 def _to_playwright(raw_cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
