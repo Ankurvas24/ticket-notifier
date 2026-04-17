@@ -1324,17 +1324,23 @@ async def _run_district_cart(page, session_id: str, target_price: str,
 
 def _derive_buytickets_url(event_url: str) -> str:
     """
-    Convert BMS event URL to buytickets entry point.
-    /sports/slug/ETXXXXXX → /buytickets/slug/ETXXXXXX
+    Return the EVENT PAGE URL as the user-facing fallback.
 
-    Used as FALLBACK when no residential proxy is configured.
+    Previously this converted /sports/ → /buytickets/, but /buytickets/ URLs
+    DO NOT WORK when pasted directly into a browser — BMS requires navigating
+    through its JS flow (event page → Book button → seat selection). Pasting
+    a /buytickets/ URL makes BMS redirect to /cinemas every time.
+
+    Now: if the URL is already a /buytickets/ path (because _run_cart was
+    given one), convert it BACK to the /events/ page so the logged-in user
+    sees the event with a Book button they can click.
     """
-    m = re.search(r"in\.bookmyshow\.com/(?:sports|events)/([^?#]+)", event_url)
+    # /buytickets/slug/ET... → /events/slug/ET... (event page works for logged-in users)
+    m = re.search(r"in\.bookmyshow\.com/buytickets/([^?#]+)", event_url)
     if m:
         slug = m.group(1).rstrip("/")
-        return f"https://in.bookmyshow.com/buytickets/{slug}"
-    if "buytickets" in event_url:
-        return event_url
+        return f"https://in.bookmyshow.com/events/{slug}"
+    # Already an event/sports page — keep as-is
     return event_url
 
 

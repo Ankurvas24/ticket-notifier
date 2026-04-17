@@ -324,7 +324,10 @@ def _derive_checkout_url(event_url: str) -> str:
     Auto-generate a BookMyShow buytickets URL from an event URL.
     /sports/event-name/ET001234  →  /buytickets/event-name/ET001234
     This is the seat selection entry point (qty popup → stadium map).
-    Falls back to the original URL if not a recognizable pattern.
+
+    NOTE: This is for the BOT's internal navigation only. The /buytickets/
+    URL does NOT work when pasted directly into a user's browser — BMS
+    redirects to /cinemas. For user-facing links, use _derive_event_url().
     """
     # BookMyShow: .../sports/slug/ETXXXXXX or .../events/slug/ETXXXXXX
     m = re.search(r'in\.bookmyshow\.com/(?:sports|events)/([^?#]+)', event_url)
@@ -340,6 +343,23 @@ def _derive_checkout_url(event_url: str) -> str:
     return event_url
 
 
+def _derive_event_url(event_url: str) -> str:
+    """
+    Return a user-friendly EVENT PAGE URL.
+
+    /buytickets/ URLs redirect to /cinemas when pasted directly — BMS
+    requires its own JS navigation flow.  The event page (/events/slug/ET...)
+    works for logged-in users: they see the event with a Book button.
+    """
+    # /buytickets/slug → /events/slug  (reverse the bot's transformation)
+    m = re.search(r'in\.bookmyshow\.com/buytickets/([^?#]+)', event_url)
+    if m:
+        slug = m.group(1).rstrip('/')
+        return f"https://in.bookmyshow.com/events/{slug}"
+    # Already an event/sports page or District — keep as-is
+    return event_url
+
+
 def notify_all(watcher, status):
     with _data_lock:
         data = load_data()
@@ -347,8 +367,11 @@ def notify_all(watcher, status):
     target_url = (
         watcher.get("cart_url")
         or watcher.get("checkout_url")
-        or _derive_checkout_url(watcher["url"])
+        or watcher["url"]                      # original event page URL
     )
+    # Ensure the user never gets a /buytickets/ link — BMS redirects those
+    # to /cinemas when pasted directly.  Event page works for logged-in users.
+    target_url = _derive_event_url(target_url)
 
     if status == "available":
         payload = {
@@ -891,14 +914,14 @@ def _store_cart_url(watcher_id: str, cart_url: str, cookies=None) -> bool:
             logger.warning(f"_store_cart_url: watcher {watcher_id} not found")
             return False
 
-        # Validate or derive
+        # Validate or derive — use EVENT page URL (not /buytickets/)
         if not _is_valid_cart_url(cart_url):
-            derived = _derive_checkout_url(
+            derived = _derive_event_url(
                 watcher.get("checkout_url") or watcher.get("url", "")
             )
             logger.warning(
                 f"cart-url for {watcher_id} was junk ({cart_url!r}) "
-                f"— using derived: {derived}"
+                f"— using event page: {derived}"
             )
             cart_url = derived
 

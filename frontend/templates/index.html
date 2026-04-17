@@ -745,7 +745,7 @@
     <!-- Cart-ready section — shown when tickets are live -->
     <div id="cart-section" style="display:none; margin-bottom:12px;">
       <div style="font-size:12px; color:#aaffcc; margin-bottom:8px;">
-        🎫 Tickets are LIVE! Tap below to open the booking page:
+        🎫 Tickets are LIVE! Tap below to open the event page and hit Book:
       </div>
       <a id="cart-pay-btn" href="#" target="_blank" rel="noopener"
          onclick="return handleCartPayClick(event)"
@@ -758,7 +758,7 @@
       <div id="cart-url-display" style="font-size:10px; color:#88cc99; margin-top:6px;
            text-align:center; word-break:break-all; opacity:.7;"></div>
       <div style="font-size:11px; color:#ffcc00; margin-top:4px; text-align:center; font-weight:600;">
-        ⚡ Opens seat selection directly - be fast!
+        ⚡ Opens the event page — tap Book on the page to select seats!
       </div>
 
       <!-- Logged-in mode info — the bot carries YOUR BMS session -->
@@ -768,8 +768,8 @@
           ✅ Bot runs with your BMS login
         </div>
         <div style="font-size:11px; color:#cfeedd; line-height:1.4; margin-bottom:8px;">
-          The cart URL above is already tied to your BookMyShow account — just tap
-          <b>Book Tickets Now</b> and pay. No cookie copying needed.
+          Make sure you're signed into BookMyShow in your browser. Tap
+          <b>Book Tickets Now</b> to open the event page, then hit the Book button on BMS.
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
           <button class="alert-btn secondary" onclick="retryCartBuild()"
@@ -808,27 +808,24 @@
       </div>
       <div style="font-size:13px; line-height:1.55; color:#ddd;">
         <p style="margin:0 0 10px;">
-          The bot is logged into <b>your</b> BookMyShow account (via the
-          <code style="background:#333;padding:1px 4px;border-radius:3px;">bms_cookies.json</code>
-          file you pasted into the project folder). When tickets drop, it locks
-          seats on your behalf and hands you a cart URL that's already tied to
-          your account.
+          TicketAlert monitors events and alerts you the <b>instant</b> tickets
+          drop. When tickets go live, you get a push notification + alarm that
+          opens the event page directly.
         </p>
         <p style="margin:0 0 10px;">
-          <b>Best way to check out:</b>
+          <b>How to book:</b>
         </p>
         <ol style="padding-left:18px; margin:0 0 10px;">
           <li>Make sure you're signed into BookMyShow in your normal browser.</li>
           <li>Tap the push notification (or the <b>Book Tickets Now</b> button above).</li>
-          <li>The cart link opens in your browser with seats already in your cart.</li>
-          <li>Pick payment → pay. Done.</li>
+          <li>The event page opens — hit the <b>Book</b> button on BMS.</li>
+          <li>Select seats → pick payment → pay. Done.</li>
         </ol>
-        <p style="margin:0 0 6px;"><b>If the page bounces to /cinemas:</b></p>
+        <p style="margin:0 0 6px;"><b>Tips for speed:</b></p>
         <ul style="padding-left:18px; margin:0;">
-          <li>Tap <b>🔄 Rebuild Cart</b> above — the bot will re-lock seats.</li>
-          <li>Or copy the cart URL and paste it while you're actively signed in.</li>
-          <li>Last resort: tap <b>📋 Copy Session</b> (advanced — only works if your
-              IP matches the bot's proxy IP, which is rare).</li>
+          <li>Stay logged into BMS in your browser at all times.</li>
+          <li>Keep your payment method saved in BMS for faster checkout.</li>
+          <li>The alert fires within seconds of tickets dropping — be ready to act fast.</li>
         </ul>
         <div style="margin-top:10px;">
           <button class="alert-btn secondary" onclick="copyCartCookies()"
@@ -1120,27 +1117,34 @@
     return true;
   }
 
-  function _deriveBuyTicketsUrl(rawUrl) {
-    const bmsMatch = rawUrl.match(/in\.bookmyshow\.com\/(?:sports|events)\/([^?#]+)/);
-    if (bmsMatch) {
-      return 'https://in.bookmyshow.com/buytickets/' + bmsMatch[1].replace(/\/+$/, '');
+  function _deriveEventPageUrl(rawUrl) {
+    // Convert /buytickets/ back to /events/ — buytickets URLs redirect to /cinemas
+    // when pasted directly. Event page works for logged-in users (shows Book button).
+    const btMatch = rawUrl.match(/in\.bookmyshow\.com\/buytickets\/([^?#]+)/);
+    if (btMatch) {
+      return 'https://in.bookmyshow.com/events/' + btMatch[1].replace(/\/+$/, '');
     }
+    // Already an event/sports page — keep as-is
     return rawUrl;
   }
 
   function resolveWatcherTargetUrl(w, { preferCart = true } = {}) {
     // Use cart_url only if it's actually a useful booking URL (not homepage)
-    if (preferCart && w.cart_url && _isUsefulBookingUrl(w.cart_url)) return w.cart_url;
+    if (preferCart && w.cart_url && _isUsefulBookingUrl(w.cart_url)) {
+      return _deriveEventPageUrl(w.cart_url);  // sanitize: no /buytickets/
+    }
 
     let targetUrl = w.checkout_url || w.url || '';
     if (targetUrl) {
-      targetUrl = _deriveBuyTicketsUrl(targetUrl);
+      targetUrl = _deriveEventPageUrl(targetUrl);
     }
     return targetUrl;
   }
 
   function isDirectBookingUrl(url) {
     if (!url) return false;
+    // Event page URLs with an ET code are valid booking entry points
+    if (/\/(?:events|sports)\/[^/]+\/ET\d{6,}/i.test(url)) return true;
     return /(ticket-options|cart|checkout|payment|order|booking|buytickets)/i.test(url);
   }
 
@@ -1439,7 +1443,7 @@
     let validUrl = url;
     if (!_isUsefulBookingUrl(validUrl) && watcherId) {
       const w = watchers.find(w => w.id === watcherId);
-      if (w) validUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
+      if (w) validUrl = _deriveEventPageUrl(w.checkout_url || w.url || '');
     }
 
     _fallbackOpenUrl = validUrl || null;
@@ -1583,7 +1587,7 @@
     if (_otpPollTimer) clearInterval(_otpPollTimer);
     _sessionId = `${watcherId}-cart`;
     _cookieWatcherId = watcherId;
-    updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
+    updateAlertOpenButton(null, { enabled: false, label: 'Preparing Link...' });
     document.getElementById('alert-body').textContent =
       '🤖 Picking cheapest tier and max seats — standby…';
 
@@ -1601,40 +1605,43 @@
           // Cart is ready — show booking link
           let cartUrl = data.cart_url || '';
 
-          // Validate: if cart_url is just the homepage, derive the real buytickets URL
+          // Always sanitize: convert /buytickets/ → /events/ (buytickets redirects to /cinemas)
+          cartUrl = _deriveEventPageUrl(cartUrl);
+
+          // Validate: if cart_url is just the homepage, use event page URL
           if (!_isUsefulBookingUrl(cartUrl)) {
             const w = watchers.find(w => w.id === watcherId);
-            if (w) cartUrl = _deriveBuyTicketsUrl(w.checkout_url || w.url || '');
+            if (w) cartUrl = _deriveEventPageUrl(w.checkout_url || w.url || '');
           }
 
           document.getElementById('cart-section').style.display = 'block';
           document.getElementById('alert-title').textContent = 'TICKETS LIVE - BOOK NOW!';
           document.getElementById('alert-body').textContent  =
-            'Tap below to open your cart and complete payment!';
+            'Tap below to open the event page — hit Book on BMS to grab seats!';
 
           if (cartUrl && _isUsefulBookingUrl(cartUrl)) {
             document.getElementById('cart-pay-btn').href = cartUrl;
             document.getElementById('cart-url-display').textContent = cartUrl;
             _currentCartUrl = cartUrl;
             _fallbackOpenUrl = cartUrl;
-            updateAlertOpenButton(cartUrl, { enabled: true, label: 'Open Cart' });
+            updateAlertOpenButton(cartUrl, { enabled: true, label: 'Open Event Page' });
           } else {
             const fallback = _fallbackOpenUrl || '';
             if (fallback) {
               document.getElementById('cart-pay-btn').href = fallback;
               document.getElementById('cart-url-display').textContent = fallback;
               _currentCartUrl = fallback;
-              updateAlertOpenButton(fallback, { enabled: true, label: 'Open Cart' });
+              updateAlertOpenButton(fallback, { enabled: true, label: 'Open Event Page' });
             } else {
               document.getElementById('cart-pay-btn').href = '#';
               document.getElementById('cart-url-display').textContent = 'Waiting for URL...';
-              updateAlertOpenButton(null, { enabled: false, label: 'Preparing Cart...' });
+              updateAlertOpenButton(null, { enabled: false, label: 'Preparing Link...' });
             }
           }
 
           playAlarmSound();
           clearInterval(_otpPollTimer);
-          showToast('Cart ready! Tap to pay.', 'success');
+          showToast('Tickets LIVE! Tap to book.', 'success');
           // Refresh cookie count in the banner
           _refreshCookieCount(watcherId);
         } else if (data.status === 'failed') {
