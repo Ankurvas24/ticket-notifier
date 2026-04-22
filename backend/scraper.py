@@ -79,18 +79,58 @@ def _proxy_failure():
 
 
 # ── User-Agent pool ──────────────────────────────────────────────────────────
+# FLAW 3 FIX: conservative UAs that match the Chromium ACTUALLY shipped with
+# current Playwright releases (Chrome 124–126). Mismatched UAs are the #1
+# signal Akamai uses to flag automated traffic — claiming Chrome 131 while
+# running Chromium 125 is an instant block.
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
+
+
+def _build_ua_pool(browser_version: str) -> list[str]:
+    """Build a UA pool whose major version matches the launched Chromium."""
+    try:
+        major = int(browser_version.split(".")[0])
+    except Exception:
+        return USER_AGENTS
+    v = f"{major}.0.0.0"
+    return [
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+    ]
+
+
+# FLAW 4 FIX: Dedicated long-lived event loop for Strategy 5.
+# The original code created a NEW asyncio loop on every Playwright fallback
+# (whenever `asyncio.run` raised RuntimeError because we were nested inside
+# another loop's executor), then closed it — but the selector-event internal
+# state accumulated per-loop and was never reclaimed, leaking file
+# descriptors + memory. One loop, reused forever, avoids that leak entirely.
+_PW_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_PW_LOOP_LOCK = None  # lazy-initialized threading.Lock
+
+
+def _get_playwright_loop() -> asyncio.AbstractEventLoop:
+    """Return a single long-lived asyncio loop for Strategy 5 Playwright calls."""
+    global _PW_LOOP, _PW_LOOP_LOCK
+    if _PW_LOOP_LOCK is None:
+        import threading as _t
+        _PW_LOOP_LOCK = _t.Lock()
+    with _PW_LOOP_LOCK:
+        if _PW_LOOP is None or _PW_LOOP.is_closed():
+            _PW_LOOP = asyncio.new_event_loop()
+            logger.info("Created persistent Playwright fallback event loop")
+        return _PW_LOOP
 
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
@@ -574,7 +614,6 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
     except ImportError:
         pass
 
-    ua = random.choice(USER_AGENTS)
     vp = random.choice(VIEWPORTS)
     proxy = _get_playwright_proxy()
 
@@ -587,6 +626,13 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
+
+        # FLAW 3 FIX: build UA from the actual Chromium version just launched
+        try:
+            ua_pool = _build_ua_pool(browser.version)
+        except Exception:
+            ua_pool = USER_AGENTS
+        ua = random.choice(ua_pool)
 
         ctx_kwargs = {
             "user_agent":  ua,
@@ -850,13 +896,17 @@ def check_url_availability(url: str, use_browser: bool = True) -> dict:
         _pw_max_attempts = 2
         for _pw_attempt in range(1, _pw_max_attempts + 1):
             try:
+                # FLAW 4 FIX: use the persistent loop instead of
+                # creating+closing a new one on every call (which leaked
+                # file descriptors and selector state under load).
                 try:
                     html = asyncio.run(_fetch_with_playwright(url))
                 except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    html = loop.run_until_complete(_fetch_with_playwright(url))
-                    loop.close()
+                    pw_loop = _get_playwright_loop()
+                    asyncio.set_event_loop(pw_loop)
+                    html = pw_loop.run_until_complete(
+                        _fetch_with_playwright(url)
+                    )
 
                 if html:
                     result = _parse_html(html, url)

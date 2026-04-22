@@ -101,6 +101,74 @@ def _rate_limit_check():
         if _check_rate_limit(key, max_requests=60, window_seconds=60):
             return jsonify({"error": "Too many requests — slow down"}), 429
 
+
+# ── FLAW 7 FIX: CSRF protection for mutating API endpoints ──────────────────
+# The /api/subscribe and /api/watchers POST endpoints were previously
+# callable cross-origin by any website the user happened to visit (classic
+# CSRF). We now enforce two layers:
+#   1) Double-submit: the request MUST carry a custom header
+#      (`X-Requested-With: XMLHttpRequest` or `X-CSRF-Token: <anything>`).
+#      Browsers do NOT let <form> or <img> cross-origin requests set custom
+#      headers without a CORS preflight, so this single check blocks 99%
+#      of drive-by CSRF attempts.
+#   2) Same-origin: if an Origin / Referer header is present, it MUST
+#      match our BASE_URL (when configured).
+_CSRF_EXEMPT_PATHS = {
+    # Auth callback comes from Google — no custom headers available.
+    "/auth/callback",
+    "/auth/login",
+    "/auth/logout",
+    # cart-ready hook is called in-process via 127.0.0.1; skip CSRF.
+    # (The worker posts to /api/watchers/<id>/cart-url over loopback.)
+}
+
+
+def _origin_is_allowed(origin_or_referer: str) -> bool:
+    if not origin_or_referer:
+        return True  # many browsers omit Origin on same-origin XHR
+    if not _base_url:
+        return True  # no BASE_URL configured — dev mode, be permissive
+    return origin_or_referer.startswith(_base_url)
+
+
+@app.before_request
+def _csrf_check():
+    """
+    Reject mutating /api/ requests that lack a custom header or come from
+    a disallowed origin. GET/HEAD/OPTIONS are safe and always allowed.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    path = request.path or ""
+    if not path.startswith("/api/"):
+        return None
+    if path in _CSRF_EXEMPT_PATHS:
+        return None
+    # Loopback POSTs from the cart worker are trusted (same process)
+    if request.remote_addr in ("127.0.0.1", "::1") and \
+            path.endswith("/cart-url"):
+        return None
+
+    has_xrw = (request.headers.get("X-Requested-With", "").lower()
+               == "xmlhttprequest")
+    has_token = bool(request.headers.get("X-CSRF-Token"))
+    if not (has_xrw or has_token):
+        logger.warning(
+            f"Blocked CSRF-suspect request from {request.remote_addr} "
+            f"to {path} (no X-Requested-With / X-CSRF-Token header)"
+        )
+        return jsonify({
+            "error": "CSRF protection: missing X-Requested-With header"
+        }), 403
+
+    origin = request.headers.get("Origin") or request.headers.get("Referer", "")
+    if origin and not _origin_is_allowed(origin):
+        logger.warning(
+            f"Blocked cross-origin POST to {path} from origin={origin}"
+        )
+        return jsonify({"error": "Cross-origin request blocked"}), 403
+    return None
+
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "")
 VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "")
 VAPID_CLAIMS      = {"sub": f"mailto:{os.environ.get('CONTACT_EMAIL', 'alerts@ticketalert.app')}"}
@@ -149,9 +217,18 @@ def send_ring_call(event_name: str, cart_url: str = ""):
         from twilio.rest import Client
         client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-        # TwiML spoken when the user picks up
-        # Strip all XML-unsafe chars and limit length to prevent TwiML injection
-        safe_name = re.sub(r'[<>&"\']', '', event_name)[:120]
+        # FLAW 8 FIX: STRICT WHITELIST sanitization. The old pattern
+        # `re.sub(r'[<>&"\']', ...)` let through Unicode lookalikes
+        # (fullwidth '＜', zero-width characters, etc.) that some XML
+        # parsers on Twilio's edge tolerate, opening a TwiML-injection
+        # surface. We now keep ONLY ASCII letters, digits, spaces, and a
+        # tiny safe punctuation set — everything else is dropped.
+        safe_name = re.sub(r"[^A-Za-z0-9 .,\-]", "", event_name or "")
+        safe_name = safe_name.strip()[:120] or "your event"
+        # Double-layer: XML-escape as a belt-and-braces measure
+        from xml.sax.saxutils import escape as _xml_escape
+        safe_name = _xml_escape(safe_name)
+
         twiml = f"""
         <Response>
             <Say voice="alice" language="en-IN" loop="2">

@@ -849,6 +849,32 @@
   <script>
   const VAPID_PUBLIC_KEY = "{{ vapid_public_key }}";
 
+  // ── FLAW 7 FIX: auto-attach X-Requested-With to every same-origin fetch()
+  // so the backend's CSRF guard accepts our XHRs. Cross-origin pages can't
+  // add this header without triggering a CORS preflight, which we reject —
+  // so drive-by CSRF from another site is blocked at the browser level.
+  (function patchFetchForCsrf() {
+    const _origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      init = init || {};
+      const headers = new Headers(init.headers || {});
+      // Only add for same-origin requests; cross-origin would require CORS
+      let urlStr = "";
+      try { urlStr = (typeof input === 'string') ? input : (input && input.url) || ""; }
+      catch (e) { urlStr = ""; }
+      const isRelative = urlStr.startsWith("/") && !urlStr.startsWith("//");
+      const isSameOrigin = isRelative ||
+        (urlStr && urlStr.startsWith(window.location.origin));
+      if (isSameOrigin && !headers.has("X-Requested-With")) {
+        headers.set("X-Requested-With", "XMLHttpRequest");
+      }
+      init.headers = headers;
+      // Default credentials: 'same-origin' so auth cookies flow on /api/*
+      if (!init.credentials) init.credentials = 'same-origin';
+      return _origFetch(input, init);
+    };
+  })();
+
   // ── Google auth UI + Login Gate ──────────────────────────────────────────────
   let _isLoggedIn = false;
 

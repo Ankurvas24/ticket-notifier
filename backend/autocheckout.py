@@ -77,19 +77,41 @@ DISTRICT_QUEUE_MAX_S   = 600      # give up queue after 10 min
 # Maximum seats to try to grab — we always go for the max available.
 DEFAULT_MAX_QTY = 10
 
-# User-Agent pool — real desktop Chrome strings
+# User-Agent pool — MUST match the Chromium major version that Playwright
+# actually ships, otherwise Akamai flags the UA-vs-runtime mismatch and
+# blocks instantly. We build UAs at runtime from `browser.version` (see
+# _build_ua_pool()); this static list is just a sane fallback.
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 ]
+
+
+def _build_ua_pool(browser_version: str) -> list[str]:
+    """
+    Build a pool of UA strings whose Chrome major version matches the
+    actual Chromium that Playwright just launched (prevents the Akamai
+    UA/runtime-mismatch fingerprint block).
+    """
+    # browser.version returns strings like "131.0.6778.33" or just "125.0"
+    try:
+        major = int(browser_version.split(".")[0])
+    except Exception:
+        # fallback to the static list if version parsing fails
+        return USER_AGENTS
+    v = f"{major}.0.0.0"
+    return [
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
+    ]
 
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
@@ -99,11 +121,20 @@ VIEWPORTS = [
 ]
 
 # ── BookMyShow-specific selectors ────────────────────────────────────────────
+# FLAW 5 FIX: React auto-hashes classnames at build time (qty-picker_a4f21),
+# so raw `[class*='qty-picker']` patterns will silently break the next time
+# BMS ships a deploy. We lead with TEXT-based locators (robust across redeploys)
+# and only fall through to class patterns as a best-effort backup.
 
 BMS_QTY_DETECT = [
-    "text=How many seats",
-    "text=How Many Seats",
-    "text=how many",
+    # Text-based first — survives React class hashing
+    "text=/how\\s*many\\s*seats/i",
+    "text=/select\\s*number\\s*of\\s*seats/i",
+    "text=/number\\s*of\\s*tickets/i",
+    ":has-text('How Many Seats')",
+    # ARIA / role based
+    "[role='dialog'] >> text=/seat/i",
+    # Legacy class fallbacks
     "[class*='howManySeats']",
     "[class*='qty-picker']",
     "[class*='seatPicker']",
@@ -339,48 +370,106 @@ def _build_proxy_config() -> Optional[dict]:
 # §6  NETWORK INTERCEPTION — Seat Lock Verification
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _is_seat_lock_response(response) -> bool:
+    """Predicate used by page.expect_response to match BMS/District lock APIs."""
+    try:
+        url_lower = response.url.lower()
+    except Exception:
+        return False
+    if not any(p in url_lower for p in SEAT_LOCK_URL_PATTERNS):
+        return False
+    # Only successful API responses count as "lock acquired"
+    try:
+        return 200 <= response.status < 400
+    except Exception:
+        return False
+
+
+class _ResponseWatcher:
+    """
+    FLAW 6 FIX: Proper asyncio-native response watcher.
+
+    Replaces the old `page.on("response") + while time.time() < deadline`
+    polling loop (which had race conditions + CPU burn) with a single
+    `asyncio.Future` that completes the instant the matching response
+    fires. The listener is always cleaned up in `stop()`, preventing the
+    memory leak that plagued the previous version.
+
+    Usage:
+        watcher = _ResponseWatcher(page, _is_seat_lock_response)
+        watcher.start()
+        try:
+            await trigger_click()
+            resp = await watcher.wait(timeout_ms=12_000)
+        finally:
+            watcher.stop()
+    """
+    def __init__(self, page, predicate):
+        self._page = page
+        self._predicate = predicate
+        self._loop = asyncio.get_event_loop()
+        self._future: asyncio.Future = self._loop.create_future()
+        self._started = False
+
+    def _on_response(self, response):
+        if self._future.done():
+            return
+        try:
+            if self._predicate(response):
+                # Schedule result onto the running loop (thread-safe)
+                self._loop.call_soon_threadsafe(
+                    self._future.set_result, response
+                )
+        except Exception:
+            pass
+
+    def start(self):
+        if not self._started:
+            self._page.on("response", self._on_response)
+            self._started = True
+
+    def stop(self):
+        if self._started:
+            try:
+                self._page.remove_listener("response", self._on_response)
+            except Exception:
+                pass
+            self._started = False
+        if not self._future.done():
+            self._future.cancel()
+
+    async def wait(self, timeout_ms: int):
+        try:
+            return await asyncio.wait_for(self._future, timeout=timeout_ms / 1000)
+        except asyncio.TimeoutError:
+            return None
+
+
 async def _wait_for_seat_lock(page, session_id: str,
                               timeout_ms: int = SEAT_LOCK_TIMEOUT_MS) -> Optional[dict]:
     """
-    Monitor the network layer for a seat-lock / cart-creation API response.
-    We do NOT navigate forward until this returns 200.
+    Backwards-compatible wrapper around _ResponseWatcher for callers that
+    want a single-shot wait AFTER the click has already happened. Prefer the
+    explicit watcher pattern when you can attach the listener BEFORE the
+    click that triggers the XHR.
     """
     _update(session_id, message="Waiting for seat lock confirmation...")
-
-    lock_response = {"value": None}
-
-    def _on_response(response):
-        url_lower = response.url.lower()
-        for pattern in SEAT_LOCK_URL_PATTERNS:
-            if pattern in url_lower:
-                if response.status == 200:
-                    logger.info(
-                        f"[{session_id}] Seat lock confirmed: "
-                        f"{response.status} {response.url[:120]}"
-                    )
-                    lock_response["value"] = response
-                else:
-                    logger.warning(
-                        f"[{session_id}] Seat lock non-200: "
-                        f"{response.status} {response.url[:120]}"
-                    )
-                break
-
-    page.on("response", _on_response)
-
-    deadline = time.time() + (timeout_ms / 1000)
-    while time.time() < deadline and lock_response["value"] is None:
-        await asyncio.sleep(0.3)
-
-    page.remove_listener("response", _on_response)
-
-    if lock_response["value"]:
-        _update(session_id, message="Seats locked! Proceeding to cart...")
-        return lock_response["value"]
-    else:
+    watcher = _ResponseWatcher(page, _is_seat_lock_response)
+    watcher.start()
+    try:
+        resp = await watcher.wait(timeout_ms)
+        if resp is not None:
+            logger.info(
+                f"[{session_id}] Seat lock confirmed: "
+                f"{resp.status} {resp.url[:120]}"
+            )
+            _update(session_id, message="Seats locked! Proceeding to cart...")
+            return resp
         logger.warning(f"[{session_id}] Seat lock timeout after {timeout_ms}ms")
         _update(session_id, message="Seat lock timed out — proceeding anyway...")
         return None
+    finally:
+        watcher.stop()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -499,7 +588,17 @@ async def _bms_select_cheapest_category(page, session_id: str,
     await _human_delay(1.0, 2.0)
 
     candidates = []
+    # FLAW 5 FIX: BMS's venueCategory/category classes are React-hashed and
+    # flip between deploys. We now scan via ARIA roles + ₹/price text first
+    # (stable markers of a price tier), then fall back to class-based hints.
     category_selectors = [
+        # Text-based: price tier rows always contain a "₹" symbol
+        "li:has-text('₹')",
+        "[role='listitem']:has-text('₹')",
+        "[role='button']:has-text('₹')",
+        "div:has(> *:text-matches('₹\\s*\\d', 'i'))",
+        "aside li:has-text('₹')",
+        # Legacy class fallbacks
         "[class*='venueCategory'] [class*='category']",
         "[class*='category-list'] li",
         "[class*='price-card']",
@@ -856,31 +955,83 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
             logger.warning(f"[{session_id}] No seat lock intercepted — cautious proceed")
 
     pre_book_url = await _bms_capture_url(page, session_id)
+    logger.info(f"[{session_id}] pre-book URL: {pre_book_url}")
 
     _update(session_id, message="Adding to cart...")
     await _human_delay(0.5, 1.0)
 
+    # ── FLAW 1 + 9 FIX: Attach a response watcher BEFORE clicking Book so we
+    #    capture the real cart-creation / transaction URL as it fires —
+    #    that URL carries a transaction ID tied to the user's BMS account
+    #    and is the one the user actually needs to open to pay.
+    cart_watcher = _ResponseWatcher(page, _is_seat_lock_response)
+    cart_watcher.start()
+
     clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
+    captured_txn_url = ""
     if clicked_book:
         logger.info(f"[{session_id}] Clicked Book button")
         try:
-            # FORCE Playwright to wait for the actual checkout page to load
-            await page.wait_for_url("**/*checkout*", timeout=15_000)
+            # Wait up to 12s for the cart/checkout/ticket-options XHR response
+            txn_resp = await cart_watcher.wait(timeout_ms=12_000)
+            if txn_resp is not None:
+                captured_txn_url = (txn_resp.url or "")
+                logger.info(
+                    f"[{session_id}] 🎯 Captured transaction response: "
+                    f"{txn_resp.status} {captured_txn_url[:160]}"
+                )
+        except Exception as e:
+            logger.warning(f"[{session_id}] Transaction watch error: {e}")
+
+        # FLAW 1 FIX: the old code only matched `**/*checkout*` in the URL,
+        # but BMS lands users on /ticket-options, /payment, /order, /seat-layout
+        # depending on the event type. Match ANY of these; don't give up on
+        # the single checkout pattern.
+        for url_glob in (
+            "**/*checkout*", "**/*ticket-options*", "**/*payment*",
+            "**/*order*", "**/*seat-layout*", "**/*cart*",
+        ):
+            try:
+                await page.wait_for_url(url_glob, timeout=4_000)
+                logger.info(f"[{session_id}] Landed on cart URL matching {url_glob}")
+                break
+            except Exception:
+                continue
+        try:
             await page.wait_for_load_state("networkidle", timeout=5_000)
         except Exception:
             pass
 
         # Try to handle contact details after clicking Book
         await _bms_handle_contact_details(page, session_id, owner_email)
-        
+
         # In case there's another proceed jump (e.g. order-summary confirmation)
         try:
             await page.wait_for_load_state("networkidle", timeout=5_000)
         except Exception:
             pass
+    cart_watcher.stop()
 
     # Grab the actual final URL
     cart_url = await _bms_capture_url(page, session_id)
+
+    # FLAW 9: Prefer the transaction URL we captured from the XHR response
+    # IF it points to a real checkout/ticket-options page (not just the lock
+    # API endpoint). This is the link that survives IP transfer because it's
+    # signed with the logged-in user's MEMBERID/transaction token.
+    if captured_txn_url:
+        low = captured_txn_url.lower()
+        # Only use the captured URL if it looks like a user-facing page
+        # (contains ticket-options / checkout / payment / order) — lock/addtocart
+        # endpoints are API-only and would 404 if the user opens them.
+        if any(tok in low for tok in
+               ("ticket-options", "/checkout", "/payment", "/order", "/cart")):
+            if not cart_url or not _is_useful_cart_url(cart_url):
+                cart_url = captured_txn_url
+                logger.info(
+                    f"[{session_id}] Promoted captured transaction URL "
+                    f"as cart_url (was junk)"
+                )
 
     return cart_url
 
@@ -1375,7 +1526,6 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
     _update(session_id, status="running",
             message="Starting cart session — cheapest tier + max seats...")
 
-    ua = random.choice(USER_AGENTS)
     vp = random.choice(VIEWPORTS)
     proxy = _build_proxy_config()
 
@@ -1388,6 +1538,16 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
+
+        # ── FLAW 3 FIX: dynamically match UA to the Chromium we just launched
+        #    so Akamai can't flag a "Chrome 131 claim from Chromium 125" mismatch.
+        try:
+            real_version = browser.version  # e.g. "125.0.6422.112"
+            ua_pool = _build_ua_pool(real_version)
+            logger.info(f"[{session_id}] Chromium runtime version: {real_version}")
+        except Exception:
+            ua_pool = USER_AGENTS
+        ua = random.choice(ua_pool)
 
         ctx_kwargs = {
             "user_agent":        ua,
@@ -1508,6 +1668,20 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             except Exception as e:
                 logger.warning(f"[{session_id}] Warmup step failed ({e}) — continuing")
 
+            # ── FLAW 1 FIX: snapshot cookies after warmup so we can prove
+            #    (in logs) that the bot earned CF clearance + carries the
+            #    user's auth wristband into the event page.
+            try:
+                post_warmup_cookies = await ctx.cookies()
+                warmup_names = sorted({c.get("name", "") for c in post_warmup_cookies})
+                logger.info(
+                    f"[{session_id}] 🍪 {len(post_warmup_cookies)} cookies after "
+                    f"warmup: {warmup_names[:20]}"
+                    f"{'…' if len(warmup_names) > 20 else ''}"
+                )
+            except Exception as _e:
+                logger.warning(f"[{session_id}] cookie snapshot failed: {_e}")
+
             # ── Navigate to the actual event/checkout URL ────────────────
             logger.info(f"[{session_id}] Navigating → {checkout_url}")
             _update(session_id, message="Navigating to event page...")
@@ -1515,6 +1689,21 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                             timeout=NAV_TIMEOUT_MS)
             try:
                 await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
+            except Exception:
+                pass
+
+            # Snapshot cookies again after hitting the event page — this is
+            # where Akamai/CF typically sets _abck/bm_sz/cf_clearance values
+            # tied to the proxy IP. Logging names (not values) makes debugging
+            # cookie-transfer issues much faster in Railway logs.
+            try:
+                post_nav_cookies = await ctx.cookies()
+                nav_names = sorted({c.get("name", "") for c in post_nav_cookies})
+                logger.info(
+                    f"[{session_id}] 🍪 {len(post_nav_cookies)} cookies after "
+                    f"event-page nav: {nav_names[:25]}"
+                    f"{'…' if len(nav_names) > 25 else ''}"
+                )
             except Exception:
                 pass
 
@@ -1797,47 +1986,92 @@ _worker_thread: Optional[threading.Thread] = None
 _worker_started = threading.Event()
 
 
+# Maximum cart jobs to run CONCURRENTLY on the single worker loop.
+# Each job spawns its own Playwright browser so we cap this to avoid
+# exhausting the Railway container's memory/CPU. 3 is safe on a 512MB box.
+_MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_CART_JOBS", "3"))
+
+
+async def _process_job(job: "BookingJob"):
+    """Wrapper: run a single booking job and log any failure."""
+    sid = _session_id(job.watcher_id)
+    try:
+        logger.info(
+            f"Worker processing: watcher={job.watcher_id} "
+            f"url={job.checkout_url[:80]} target={job.target_price} "
+            f"max_qty={job.max_qty}"
+        )
+        has_proxy = all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD])
+        if not has_proxy:
+            logger.warning(
+                f"[{sid}] No proxy configured — running from local IP. "
+                f"This may trigger Akamai blocks."
+            )
+        await _run_cart(
+            sid, job.checkout_url,
+            target_price=job.target_price,
+            watcher_id=job.watcher_id,
+            max_qty=job.max_qty,
+            owner_email=job.owner_email,
+        )
+    except Exception as e:
+        logger.error(f"[{sid}] Job failed: {e}", exc_info=True)
+        try:
+            _update(sid, status="failed", message=f"Job error: {str(e)[:160]}")
+        except Exception:
+            pass
+
+
+async def _job_drain_loop():
+    """
+    FLAW 2 FIX: instead of `loop.run_until_complete` (which blocks the
+    worker thread for the entire duration of ONE cart job), we keep a
+    persistent drain loop that spawns each job as an independent task.
+    This lets us process up to _MAX_CONCURRENT_JOBS tickets in parallel
+    — critical during high-demand drops where seats evaporate in seconds.
+    """
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_JOBS)
+    logger.info(
+        f"Cart worker drain loop started "
+        f"(max concurrent jobs = {_MAX_CONCURRENT_JOBS})"
+    )
+
+    async def _run_one(job: "BookingJob"):
+        async with sem:
+            await _process_job(job)
+        _job_queue.task_done()
+
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            # Blocking queue.get() would freeze the loop — run it in a
+            # thread-pool executor so the loop stays free to schedule tasks.
+            job: BookingJob = await loop.run_in_executor(None, _job_queue.get)
+            # Fire-and-forget: schedule as a concurrent task so the very
+            # next queued job can start immediately in parallel (up to
+            # the semaphore cap).
+            asyncio.create_task(_run_one(job))
+        except Exception as e:
+            logger.error(f"Drain loop error: {e}", exc_info=True)
+            # Tiny backoff so a persistent failure doesn't pin a CPU
+            await asyncio.sleep(0.5)
+
+
 def _worker_main():
     """Background thread entry point — owns its own asyncio event loop."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _worker_started.set()
     logger.info("Cart worker thread started (dedicated asyncio loop)")
-
-    while True:
+    try:
+        loop.run_until_complete(_job_drain_loop())
+    except Exception as e:
+        logger.critical(f"Worker loop crashed: {e}", exc_info=True)
+    finally:
         try:
-            try:
-                job: BookingJob = _job_queue.get(timeout=2)
-            except queue.Empty:
-                continue
-
-            logger.info(
-                f"Worker processing: watcher={job.watcher_id} "
-                f"url={job.checkout_url[:80]} target={job.target_price} "
-                f"max_qty={job.max_qty}"
-            )
-
-            sid = _session_id(job.watcher_id)
-            has_proxy = all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD])
-
-            if not has_proxy:
-                logger.warning(f"[{sid}] No proxy configured — running cart flow from local IP. This may trigger Akamai blocks.")
-
-            # Full Playwright cart flow with stealth (+ optional proxy)
-            loop.run_until_complete(
-                _run_cart(
-                    sid, job.checkout_url,
-                    target_price=job.target_price,
-                    watcher_id=job.watcher_id,
-                    max_qty=job.max_qty,
-                    owner_email=job.owner_email,
-                )
-            )
-
-            _job_queue.task_done()
-
-        except Exception as e:
-            logger.error(f"Worker error: {e}", exc_info=True)
+            loop.close()
+        except Exception:
+            pass
 
 
 def start_worker():
