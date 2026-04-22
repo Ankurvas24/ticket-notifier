@@ -420,18 +420,35 @@ def _derive_checkout_url(event_url: str) -> str:
     return event_url
 
 
+_SPORTS_SLUG_KEYWORDS = (
+    "-vs-", " vs ", "ipl-", "-ipl", "cricket", "football", "kabaddi",
+    "-t20", "-odi-", "-test-", "hockey", "badminton", "pro-kabaddi",
+    "isl-", "-isl", "pkl-", "-pkl", "wpl-", "-wpl",
+    "mumbai-indians", "chennai-super-kings", "royal-challengers",
+    "kolkata-knight-riders", "delhi-capitals", "punjab-kings",
+    "rajasthan-royals", "sunrisers-hyderabad", "gujarat-titans",
+    "lucknow-super-giants",
+)
+
+
 def _derive_event_url(event_url: str) -> str:
     """
     Return a user-friendly EVENT PAGE URL.
 
-    /buytickets/ URLs redirect to /cinemas when pasted directly — BMS
-    requires its own JS navigation flow.  The event page (/events/slug/ET...)
-    works for logged-in users: they see the event with a Book button.
+    /buytickets/ URLs 404 / redirect to /cinemas when pasted directly — BMS
+    requires its own JS navigation flow.  The public landing page works for
+    logged-in users: they see the event with a Book button.
+
+    Cricket / IPL / football events live under /sports/, everything else
+    under /events/. We sniff the slug to pick the right path.
     """
-    # /buytickets/slug → /events/slug  (reverse the bot's transformation)
+    # /buytickets/slug → /sports/slug  or  /events/slug
     m = re.search(r'in\.bookmyshow\.com/buytickets/([^?#]+)', event_url)
     if m:
         slug = m.group(1).rstrip('/')
+        low = slug.lower()
+        if any(k in low for k in _SPORTS_SLUG_KEYWORDS):
+            return f"https://in.bookmyshow.com/sports/{slug}"
         return f"https://in.bookmyshow.com/events/{slug}"
     # Already an event/sports page or District — keep as-is
     return event_url
@@ -1185,8 +1202,6 @@ def service_worker():
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json")
 
-@app.route("/api/cart-status/<watcher_id>")
-def cart_status(watcher_id):
     """
     Frontend polls this to track cart progress for a watcher.
     Returns { status, message, cart_url, session_id }.

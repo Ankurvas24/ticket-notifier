@@ -1473,25 +1473,44 @@ async def _run_district_cart(page, session_id: str, target_price: str,
 # §9  URL DERIVATION (fallback when no proxy is available)
 # ═════════════════════════════════════════════════════════════════════════════
 
+_SPORTS_KEYWORDS = (
+    "-vs-", " vs ", "ipl-", "-ipl", "cricket", "football", "kabaddi",
+    "-t20", "-odi-", "-test-", "hockey", "badminton", "pro-kabaddi",
+    "isl-", "-isl", "pkl-", "-pkl", "wpl-", "-wpl",
+    "mumbai-indians", "chennai-super-kings", "royal-challengers",
+    "kolkata-knight-riders", "delhi-capitals", "punjab-kings",
+    "rajasthan-royals", "sunrisers-hyderabad", "gujarat-titans",
+    "lucknow-super-giants",
+)
+
+
+def _looks_like_sports_slug(slug: str) -> bool:
+    """Heuristic: does this slug describe a sports/cricket event?"""
+    low = slug.lower()
+    return any(k in low for k in _SPORTS_KEYWORDS)
+
+
 def _derive_buytickets_url(event_url: str) -> str:
     """
     Return the EVENT PAGE URL as the user-facing fallback.
 
-    Previously this converted /sports/ → /buytickets/, but /buytickets/ URLs
-    DO NOT WORK when pasted directly into a browser — BMS requires navigating
-    through its JS flow (event page → Book button → seat selection). Pasting
-    a /buytickets/ URL makes BMS redirect to /cinemas every time.
+    /buytickets/ URLs DO NOT WORK when pasted directly into a browser — BMS
+    requires navigating through its JS flow (event page → Book button → seat
+    selection). Pasting a /buytickets/ URL makes BMS show a 404 or redirect
+    to /cinemas.
 
-    Now: if the URL is already a /buytickets/ path (because _run_cart was
-    given one), convert it BACK to the /events/ page so the logged-in user
-    sees the event with a Book button they can click.
+    So we convert /buytickets/ → the correct PUBLIC landing page:
+      • sports events (IPL / cricket / football / kabaddi …) → /sports/
+      • everything else (concerts, plays, comedy)             → /events/
     """
-    # /buytickets/slug/ET... → /events/slug/ET... (event page works for logged-in users)
+    # /buytickets/slug/ET... → /sports/slug/ET... or /events/slug/ET...
     m = re.search(r"in\.bookmyshow\.com/buytickets/([^?#]+)", event_url)
     if m:
         slug = m.group(1).rstrip("/")
+        if _looks_like_sports_slug(slug):
+            return f"https://in.bookmyshow.com/sports/{slug}"
         return f"https://in.bookmyshow.com/events/{slug}"
-    # Already an event/sports page — keep as-is
+    # Already a /sports/ or /events/ page — keep as-is
     return event_url
 
 
@@ -1682,10 +1701,24 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             except Exception as _e:
                 logger.warning(f"[{session_id}] cookie snapshot failed: {_e}")
 
+            # ── Normalize /buytickets/ → /sports/ or /events/ before nav ──
+            # BMS's /buytickets/<slug>/ET... URLs 404 when hit directly
+            # (they only work inside the JS flow). Convert the URL to the
+            # proper public landing page so the bot AND the user's browser
+            # see real content instead of "page unavailable".
+            nav_url = checkout_url
+            if is_bms and "/buytickets/" in checkout_url.lower():
+                nav_url = _derive_buytickets_url(checkout_url)
+                if nav_url != checkout_url:
+                    logger.info(
+                        f"[{session_id}] Rewrote /buytickets/ URL for nav: "
+                        f"{checkout_url} → {nav_url}"
+                    )
+
             # ── Navigate to the actual event/checkout URL ────────────────
-            logger.info(f"[{session_id}] Navigating → {checkout_url}")
+            logger.info(f"[{session_id}] Navigating → {nav_url}")
             _update(session_id, message="Navigating to event page...")
-            await page.goto(checkout_url, wait_until="domcontentloaded",
+            await page.goto(nav_url, wait_until="domcontentloaded",
                             timeout=NAV_TIMEOUT_MS)
             try:
                 await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
