@@ -34,6 +34,7 @@ ride on top of that fresh CF session — so BMS sees a logged-in user.
 import os
 import json
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 logger = logging.getLogger("ticketalert.cookie_manager")
@@ -186,33 +187,68 @@ def _to_playwright(raw_cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         entry["path"] = c.get("path", "/")
 
-        # Expiration
+        # Expiration — accepts float epoch seconds OR ISO 8601 strings
         exp = c.get("expires", c.get("expirationDate"))
         if exp is not None:
             try:
                 entry["expires"] = float(exp)
-            except Exception:
-                pass
+            except (TypeError, ValueError):
+                # Try ISO 8601 ("2025-06-30T12:34:56Z" / "...+00:00")
+                if isinstance(exp, str):
+                    try:
+                        s = exp.strip()
+                        if s.endswith("Z"):
+                            s = s[:-1] + "+00:00"
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        entry["expires"] = dt.timestamp()
+                    except Exception:
+                        pass  # leave it unset; session cookie
 
-        if "httpOnly" in c:
-            entry["httpOnly"] = bool(c["httpOnly"])
-        if "secure" in c:
-            entry["secure"] = bool(c["secure"])
+        # Some exporters use 'httponly' / 'Http-Only' / 'HttpOnly'
+        for key in ("httpOnly", "httponly", "http_only"):
+            if key in c:
+                entry["httpOnly"] = bool(c[key])
+                break
+        for key in ("secure", "Secure", "SECURE"):
+            if key in c:
+                entry["secure"] = bool(c[key])
+                break
 
-        ss = (c.get("sameSite") or "").strip().lower()
+        # sameSite can appear under multiple casings depending on exporter
+        ss_raw = (
+            c.get("sameSite")
+            or c.get("samesite")
+            or c.get("same_site")
+            or c.get("SameSite")
+            or ""
+        )
+        ss = str(ss_raw).strip().lower()
         if ss in ("strict", "lax"):
             entry["sameSite"] = ss.capitalize()
-        elif ss in ("none", "no_restriction"):
+        elif ss in ("none", "no_restriction", "unspecified"):
             entry["sameSite"] = "None"
             entry["secure"] = True  # SameSite=None requires Secure
 
         out.append(entry)
 
-    # If no domain info at all on any cookie, duplicate each cookie for
-    # both bookmyshow.com and district.in so it works on either site
-    if out and all(("domain" in c and c["domain"] == ".bookmyshow.com") for c in out):
-        # Already attached to BMS only — that's what the user pasted; leave it.
-        pass
+    # If every cookie was assigned the default .bookmyshow.com (because no
+    # domain was specified in the source), clone them for .district.in so
+    # the same injected session works on BOTH sites. This is a no-op if
+    # the user explicitly mixed domains.
+    if out:
+        all_defaults = all(
+            c.get("domain") == ".bookmyshow.com" and "url" not in c
+            for c in out
+        )
+        if all_defaults:
+            district_clones = []
+            for c in out:
+                clone = dict(c)
+                clone["domain"] = ".district.in"
+                district_clones.append(clone)
+            out.extend(district_clones)
 
     if stripped:
         logger.info(
@@ -263,21 +299,21 @@ async def inject_cookies_if_exist(context, session_id: str = "scraper") -> bool:
         "session", "sessionid", "sessionId", "_district_session",
     )]
     logger.info(
-        f"[{session_id}] 💉 INJECTED {len(cookies)} user cookies from bms_cookies.json"
-        f" — auth cookies present: {auth_cookies}"
+        f"[{session_id}] INJECTED {len(cookies)} user cookies from bms_cookies.json"
+        f" - auth cookies present: {auth_cookies}"
     )
     if "bmsId" in names or "ud" in names:
-        logger.info(f"[{session_id}] ✅ Bot will navigate as LOGGED-IN BMS user")
+        logger.info(f"[{session_id}] Bot will navigate as LOGGED-IN BMS user")
     else:
         logger.warning(
-            f"[{session_id}] ⚠ No bmsId/ud in pasted cookies — bot may still hit login wall"
+            f"[{session_id}] No bmsId/ud in pasted cookies - bot may still hit login wall"
         )
 
     return True
 
 
 def have_user_cookies() -> bool:
-    """Quick check — returns True if BMS cookies are available (env var OR file)."""
+    """Quick check - returns True if BMS cookies are available (env var OR file)."""
     try:
         # Check env var first (production / Railway)
         if os.environ.get("BMS_COOKIES_RAW", "").strip():

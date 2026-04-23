@@ -337,6 +337,45 @@ async def _try_click_first(page, selectors: list,
     return False
 
 
+async def _goto_with_retry(page, url: str, *,
+                           wait_until: str = "domcontentloaded",
+                           timeout: int = 25_000,
+                           attempts: int = 3,
+                           backoff_lo: float = 1.5,
+                           backoff_hi: float = 3.5,
+                           session_id: str = "scraper"):
+    """
+    Navigate with retry + exponential-ish backoff.
+
+    Residential proxies drop connections mid-TLS handshake fairly often.
+    A single page.goto() failure on a flaky proxy hop would otherwise kill
+    the whole checkout attempt. We retry up to `attempts` times with a
+    randomized backoff between 1.5–3.5 s (×attempt number) so we don't
+    hammer the proxy on persistent failures either.
+
+    Raises the LAST exception if all attempts fail so the caller can
+    handle it as a hard failure (e.g. falling back to URL derivation).
+    """
+    last_err: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            resp = await page.goto(url, wait_until=wait_until, timeout=timeout)
+            return resp
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"[{session_id}] page.goto attempt {i}/{attempts} failed for "
+                f"{url!r}: {type(e).__name__}: {str(e)[:200]}"
+            )
+            if i >= attempts:
+                break
+            wait = random.uniform(backoff_lo, backoff_hi) * i
+            await asyncio.sleep(wait)
+    # Re-raise the last error for the caller
+    assert last_err is not None
+    raise last_err
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # §5  PROXY CONFIGURATION — Sticky Sessions
 # ═════════════════════════════════════════════════════════════════════════════
@@ -410,13 +449,22 @@ class _ResponseWatcher:
         self._loop = asyncio.get_event_loop()
         self._future: asyncio.Future = self._loop.create_future()
         self._started = False
+        # arm_time = timestamp of the click we care about. Any response that
+        # fires BEFORE the click (e.g. background polls, initial page-load
+        # XHRs that happen to match the predicate) is ignored. Callers call
+        # arm() immediately before triggering the click.
+        self._arm_time: float = 0.0
+        self._matched_urls: list = []
 
     def _on_response(self, response):
         if self._future.done():
             return
+        # Ignore pre-click responses — the caller has not armed yet.
+        if self._arm_time == 0.0:
+            return
         try:
             if self._predicate(response):
-                # Schedule result onto the running loop (thread-safe)
+                self._matched_urls.append(response.url[:200])
                 self._loop.call_soon_threadsafe(
                     self._future.set_result, response
                 )
@@ -424,9 +472,15 @@ class _ResponseWatcher:
             pass
 
     def start(self):
+        """Attach the listener. Safe to call multiple times."""
         if not self._started:
             self._page.on("response", self._on_response)
             self._started = True
+
+    def arm(self):
+        """Mark the timestamp at which the click happens. Only responses
+        observed AFTER this moment count as a match."""
+        self._arm_time = time.monotonic()
 
     def stop(self):
         if self._started:
@@ -437,6 +491,10 @@ class _ResponseWatcher:
             self._started = False
         if not self._future.done():
             self._future.cancel()
+
+    @property
+    def matched_urls(self):
+        return list(self._matched_urls)
 
     async def wait(self, timeout_ms: int):
         try:
@@ -456,6 +514,9 @@ async def _wait_for_seat_lock(page, session_id: str,
     _update(session_id, message="Waiting for seat lock confirmation...")
     watcher = _ResponseWatcher(page, _is_seat_lock_response)
     watcher.start()
+    # Since this wrapper is used AFTER the click already fired, arm
+    # immediately — callers trust that the matching XHR is imminent.
+    watcher.arm()
     try:
         resp = await watcher.wait(timeout_ms)
         if resp is not None:
@@ -465,7 +526,10 @@ async def _wait_for_seat_lock(page, session_id: str,
             )
             _update(session_id, message="Seats locked! Proceeding to cart...")
             return resp
-        logger.warning(f"[{session_id}] Seat lock timeout after {timeout_ms}ms")
+        logger.warning(
+            f"[{session_id}] Seat lock timeout after {timeout_ms}ms "
+            f"(candidate responses seen: {watcher.matched_urls or 'none'})"
+        )
         _update(session_id, message="Seat lock timed out — proceeding anyway...")
         return None
     finally:
@@ -810,35 +874,77 @@ async def _bms_select_max_seats(page, session_id: str, qty: int = DEFAULT_MAX_QT
 
 
 async def _bms_capture_url(page, session_id: str) -> str:
-    """Capture the best URL to send to user (ticket-options > cart > current)."""
-    url = page.url
+    """
+    Capture the best URL to send to user.
 
-    if "ticket-options" in url:
+    Priority order (best → worst):
+      1. Current page URL if it's already on ticket-options/cart/checkout/payment.
+      2. Any <a href> in the DOM pointing at ticket-options/cart/checkout.
+      3. Any URL embedded in the rendered JSON-LD / inline script on the page
+         that points at ticket-options (happens when BMS renders the CTA as
+         a JS-driven button, not an <a>).
+      4. Any iframe URL matching the cart patterns.
+      5. Fall back to the current page URL (caller will still run it through
+         _is_useful_cart_url and replace with derived URL if junk).
+    """
+    url = page.url or ""
+
+    # 1. Already on a cart-ish URL
+    if "ticket-options" in url.lower():
         logger.info(f"[{session_id}] Captured ticket-options URL: {url}")
         return url
-
     if any(k in url.lower() for k in ["cart", "checkout", "payment", "order"]):
         logger.info(f"[{session_id}] Captured cart URL: {url}")
         return url
 
+    # 2. <a href=...> in DOM
     try:
         links = await page.evaluate("""
             () => {
                 const found = [];
                 document.querySelectorAll('a[href]').forEach(a => {
-                    if (/(ticket-options|checkout|cart|payment)/.test(a.href))
-                        found.push(a.href);
+                    const h = a.href || '';
+                    if (/(ticket-options|checkout|\\/cart|payment|\\/order\\/)/i.test(h))
+                        found.push(h);
                 });
                 return found;
             }
         """)
         if links:
-            logger.info(f"[{session_id}] Found link in DOM: {links[0]}")
+            logger.info(f"[{session_id}] Found cart link in DOM: {links[0]}")
             return links[0]
     except Exception:
         pass
 
-    logger.info(f"[{session_id}] Using current URL: {url}")
+    # 3. Script-embedded URLs (JSON-LD, inline JS)
+    try:
+        embedded = await page.evaluate("""
+            () => {
+                const text = Array.from(document.querySelectorAll('script'))
+                    .map(s => s.textContent || '').join('\\n');
+                const re = /https?:\\/\\/[^'"\\s]+(?:ticket-options|\\/cart\\/|\\/checkout\\/|\\/payment\\/)[^'"\\s]*/gi;
+                const hits = text.match(re) || [];
+                return hits.slice(0, 5);
+            }
+        """)
+        if embedded:
+            logger.info(f"[{session_id}] Found cart URL in script: {embedded[0]}")
+            return embedded[0]
+    except Exception:
+        pass
+
+    # 4. iframe URLs
+    try:
+        for fr in page.frames:
+            furl = (fr.url or "")
+            if any(tok in furl.lower()
+                   for tok in ("ticket-options", "cart", "checkout", "payment")):
+                logger.info(f"[{session_id}] Found iframe cart URL: {furl}")
+                return furl
+    except Exception:
+        pass
+
+    logger.info(f"[{session_id}] Using current URL as fallback: {url}")
     return url
 
 
@@ -966,6 +1072,7 @@ async def _run_bms_cart(page, session_id: str, target_price: str,
     #    and is the one the user actually needs to open to pay.
     cart_watcher = _ResponseWatcher(page, _is_seat_lock_response)
     cart_watcher.start()
+    cart_watcher.arm()   # record timestamp BEFORE click so pre-click XHRs are ignored
 
     clicked_book = await _try_click_first(page, BMS_BOOK, timeout=4_000)
     captured_txn_url = ""
@@ -1566,7 +1673,38 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             logger.info(f"[{session_id}] Chromium runtime version: {real_version}")
         except Exception:
             ua_pool = USER_AGENTS
+            real_version = "125.0.0.0"
         ua = random.choice(ua_pool)
+
+        # ── Extract major Chrome version from UA so sec-ch-ua header matches ──
+        # Akamai cross-checks User-Agent against sec-ch-ua; any mismatch is a
+        # strong bot signal. Build the header dynamically from the runtime UA.
+        _ch_major = "125"
+        try:
+            _m = re.search(r"Chrome/(\d+)", ua)
+            if _m:
+                _ch_major = _m.group(1)
+        except Exception:
+            pass
+
+        # ── Pick OS + platform from the UA so all signals tell one story ──
+        _ua_lower = ua.lower()
+        if "windows" in _ua_lower:
+            _platform = '"Windows"'
+        elif "macintosh" in _ua_lower or "mac os x" in _ua_lower:
+            _platform = '"macOS"'
+        elif "linux" in _ua_lower and "android" not in _ua_lower:
+            _platform = '"Linux"'
+        elif "android" in _ua_lower:
+            _platform = '"Android"'
+        else:
+            _platform = '"Windows"'
+
+        _sec_ch_ua = (
+            f'"Chromium";v="{_ch_major}", '
+            f'"Google Chrome";v="{_ch_major}", '
+            f'"Not=A?Brand";v="99"'
+        )
 
         ctx_kwargs = {
             "user_agent":        ua,
@@ -1576,9 +1714,31 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             "extra_http_headers": {
                 "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
                 "Accept":          "text/html,application/xhtml+xml,"
-                                   "application/xml;q=0.9,*/*;q=0.8",
+                                   "application/xml;q=0.9,image/avif,"
+                                   "image/webp,image/apng,*/*;q=0.8,"
+                                   "application/signed-exchange;v=b3;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
                 "DNT":             "1",
+                "Upgrade-Insecure-Requests": "1",
+                # Client Hints — must match the UA exactly or Akamai flags it
+                "Sec-Ch-Ua":          _sec_ch_ua,
+                "Sec-Ch-Ua-Mobile":   "?0",
+                "Sec-Ch-Ua-Platform": _platform,
+                # Sec-Fetch metadata — the defaults for a top-level navigation.
+                # Missing these is one of the strongest bot signals on BMS/Akamai.
+                "Sec-Fetch-Site":     "none",
+                "Sec-Fetch-Mode":     "navigate",
+                "Sec-Fetch-User":     "?1",
+                "Sec-Fetch-Dest":     "document",
+                "Cache-Control":      "max-age=0",
             },
+            "color_scheme":      "light",
+            "reduced_motion":    "no-preference",
+            "has_touch":         False,
+            "is_mobile":         False,
+            # Permissions kept intentionally empty — Akamai flags contexts that
+            # auto-grant geolocation/notifications that a fresh browser wouldn't.
+            "permissions":       [],
         }
         if proxy:
             ctx_kwargs["proxy"] = proxy
@@ -1598,33 +1758,166 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             except Exception as e:
                 logger.warning(f"[{session_id}] Stealth.apply_stealth_async failed ({e})")
 
-        if not stealth_applied:
-            await ctx.add_init_script("""
-                Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-                try{delete navigator.__proto__.webdriver}catch(e){}
-                Object.defineProperty(navigator,'plugins',{
-                    get:()=>[{name:'Chrome PDF Plugin',filename:'internal-pdf-viewer',
-                    description:'Portable Document Format',length:1},
-                    {name:'Chrome PDF Viewer',filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-                    description:'',length:1},
-                    {name:'Native Client',filename:'internal-nacl-plugin',
-                    description:'',length:2}]
+        # ── Always layer manual stealth patches ON TOP of stealth v2. ──
+        # Stealth v2 covers the common fingerprints but Akamai/Datadome look
+        # at more surfaces (canvas noise, audio fp, device memory, fb_device_id,
+        # permissions, chrome.app, high-entropy hints). These extra patches
+        # don't conflict with stealth v2 — they just plug the remaining holes.
+        await ctx.add_init_script("""
+            (() => {
+              const pd = (obj, prop, val) => {
+                try { Object.defineProperty(obj, prop, { get: () => val, configurable: true }); } catch (e) {}
+              };
+
+              // 1. navigator.webdriver — must be undefined, not false
+              pd(navigator, 'webdriver', undefined);
+              try { delete Navigator.prototype.webdriver; } catch (e) {}
+
+              // 2. Plugins + mimeTypes — enough entries to look like real Chrome
+              const _plugins = [
+                { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+              ];
+              pd(navigator, 'plugins', _plugins);
+              pd(navigator, 'mimeTypes', [{ type: 'application/pdf', description: '', suffixes: 'pdf' }]);
+
+              // 3. Languages
+              pd(navigator, 'languages', ['en-IN', 'en-US', 'en', 'hi']);
+
+              // 4. Realistic hardware numbers (cloud VMs usually have 2 cores;
+              //    real desktops have 4–16). Pick 8 — the median consumer PC.
+              pd(navigator, 'hardwareConcurrency', 8);
+              pd(navigator, 'deviceMemory', 8);
+              pd(navigator, 'maxTouchPoints', 0);
+
+              // 5. window.chrome — must be a populated object, not just {}
+              if (!window.chrome) window.chrome = {};
+              window.chrome.runtime = window.chrome.runtime || {
+                OnInstalledReason:   { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch:        { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs:          { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+                connect:             () => ({}),
+                sendMessage:         () => ({}),
+              };
+              window.chrome.loadTimes = function() { return { requestTime: performance.now() / 1000 }; };
+              window.chrome.csi = function() { return { onloadT: Date.now(), startE: Date.now(), tran: 15 }; };
+              window.chrome.app = window.chrome.app || { isInstalled: false, getDetails: () => null, getIsInstalled: () => false };
+
+              // 6. permissions.query — notifications fix (well-known detection)
+              const _origQuery = navigator.permissions && navigator.permissions.query
+                ? navigator.permissions.query.bind(navigator.permissions) : null;
+              if (_origQuery) {
+                navigator.permissions.query = (p) => {
+                  if (p && p.name === 'notifications') {
+                    return Promise.resolve({ state: Notification.permission || 'default', onchange: null });
+                  }
+                  return _origQuery(p);
+                };
+              }
+
+              // 7. WebGL vendor/renderer mask (Intel integrated — most common)
+              const _wgl = WebGLRenderingContext && WebGLRenderingContext.prototype.getParameter;
+              if (_wgl) {
+                WebGLRenderingContext.prototype.getParameter = function(p) {
+                  // UNMASKED_VENDOR_WEBGL = 37445, UNMASKED_RENDERER_WEBGL = 37446
+                  if (p === 37445) return 'Intel Inc.';
+                  if (p === 37446) return 'Intel(R) UHD Graphics 620';
+                  return _wgl.call(this, p);
+                };
+              }
+              const _wgl2 = (typeof WebGL2RenderingContext !== 'undefined') && WebGL2RenderingContext.prototype.getParameter;
+              if (_wgl2) {
+                WebGL2RenderingContext.prototype.getParameter = function(p) {
+                  if (p === 37445) return 'Intel Inc.';
+                  if (p === 37446) return 'Intel(R) UHD Graphics 620';
+                  return _wgl2.call(this, p);
+                };
+              }
+
+              // 8. Canvas fingerprint — add tiny per-context noise so the hash
+              //    differs each run (real browsers vary slightly between GPUs;
+              //    headless Chrome always produces the same canvas hash).
+              const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+              HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                try {
+                  const ctx = this.getContext && this.getContext('2d');
+                  if (ctx && this.width > 0 && this.height > 0) {
+                    const shift = Math.floor(Math.random() * 10);
+                    ctx.fillStyle = 'rgba(0,0,0,0.0' + shift + ')';
+                    ctx.fillRect(0, 0, 1, 1);
+                  }
+                } catch (e) {}
+                return _toDataURL.apply(this, args);
+              };
+
+              // 9. Audio fingerprint — small deterministic-looking jitter so
+              //    Akamai's audio-fp buckets us as "a real machine".
+              try {
+                const OrigAudio = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+                if (OrigAudio) {
+                  const _getChannelData = AudioBuffer.prototype.getChannelData;
+                  AudioBuffer.prototype.getChannelData = function() {
+                    const d = _getChannelData.apply(this, arguments);
+                    if (d && d.length) {
+                      // Perturb every 100th sample by <1e-7
+                      for (let i = 0; i < d.length; i += 100) {
+                        d[i] = d[i] + (Math.random() - 0.5) * 1e-7;
+                      }
+                    }
+                    return d;
+                  };
+                }
+              } catch (e) {}
+
+              // 10. WebRTC — prevent local-IP leak (common bot-detection trick)
+              try {
+                const _getUserMedia = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+                if (_getUserMedia) {
+                  navigator.mediaDevices.getUserMedia = function() {
+                    return Promise.reject(new Error('NotAllowedError'));
+                  };
+                }
+              } catch (e) {}
+
+              // 11. iframe contentWindow.chrome check — many detectors test
+              //     `iframe.contentWindow.chrome` being defined
+              try {
+                const _cD = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+                Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                  get() {
+                    const cw = _cD && _cD.get && _cD.get.call(this);
+                    if (cw && !cw.chrome) { try { cw.chrome = window.chrome; } catch (e) {} }
+                    return cw;
+                  }
                 });
-                Object.defineProperty(navigator,'languages',{
-                    get:()=>['en-IN','en-US','en','hi']
-                });
-                window.chrome={runtime:{connect:()=>{},sendMessage:()=>{}},
-                    loadTimes:()=>({}),csi:()=>({})};
-                const _oq=navigator.permissions.query.bind(navigator.permissions);
-                navigator.permissions.query=p=>p.name==='notifications'
-                    ?Promise.resolve({state:Notification.permission}):_oq(p);
-                const _gp=WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter=function(p){
-                    if(p===37445)return'Intel Inc.';
-                    if(p===37446)return'Intel Iris OpenGL Engine';
-                    return _gp.call(this,p)};
-            """)
-            logger.info(f"[{session_id}] Manual JS stealth patches applied")
+              } catch (e) {}
+
+              // 12. Remove automation window properties that Playwright leaks
+              ['cdc_adoQpoasnfa76pfcZLmcfl_Array',
+               'cdc_adoQpoasnfa76pfcZLmcfl_Promise',
+               'cdc_adoQpoasnfa76pfcZLmcfl_Symbol',
+               '__webdriver_evaluate',
+               '__selenium_evaluate',
+               '__webdriver_script_function',
+               '__webdriver_script_func',
+               '__webdriver_script_fn',
+               '__fxdriver_evaluate',
+               '__driver_unwrapped',
+               '__webdriver_unwrapped',
+               '__driver_evaluate',
+               '__selenium_unwrapped',
+               '__fxdriver_unwrapped'].forEach(k => { try { delete window[k]; } catch (e) {} });
+            })();
+        """)
+        logger.info(
+            f"[{session_id}] Manual stealth patches applied "
+            f"(stealth_v2={'yes' if stealth_applied else 'no, manual only'})"
+        )
 
         page = await ctx.new_page()
 
@@ -1659,8 +1952,13 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 if warmup_url:
                     _update(session_id, message="Warming up session (Akamai handshake)...")
                     logger.info(f"[{session_id}] Warmup → {warmup_url}")
-                    await page.goto(warmup_url, wait_until="domcontentloaded",
-                                    timeout=NAV_TIMEOUT_MS)
+                    await _goto_with_retry(
+                        page, warmup_url,
+                        wait_until="domcontentloaded",
+                        timeout=NAV_TIMEOUT_MS,
+                        attempts=3,
+                        session_id=session_id,
+                    )
                     try:
                         await page.wait_for_load_state("networkidle", timeout=8_000)
                     except Exception:
@@ -1718,8 +2016,13 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             # ── Navigate to the actual event/checkout URL ────────────────
             logger.info(f"[{session_id}] Navigating → {nav_url}")
             _update(session_id, message="Navigating to event page...")
-            await page.goto(nav_url, wait_until="domcontentloaded",
-                            timeout=NAV_TIMEOUT_MS)
+            await _goto_with_retry(
+                page, nav_url,
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT_MS,
+                attempts=3,
+                session_id=session_id,
+            )
             try:
                 await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_MS)
             except Exception:
@@ -1972,6 +2275,9 @@ def _is_useful_cart_url(cart_url: str) -> bool:
     path = parsed.path or ""
     if path.rstrip("/").lower() in _JUNK_CART_PATHS:
         return False
+    # BMS event IDs are "ET" followed by 6+ digits - match case-insensitive
+    if re.search(r"/ET\d{6,}", cart_url, re.IGNORECASE):
+        return True
     lowered = cart_url.lower()
     if not any(tok.lower() in lowered for tok in _VALID_CART_TOKENS):
         return False

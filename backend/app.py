@@ -53,7 +53,19 @@ _secret = os.environ.get("SECRET_KEY", "")
 if not _secret:
     import secrets
     _secret = secrets.token_hex(32)
-    logger.warning("SECRET_KEY not set — generated ephemeral key (sessions won't survive restarts)")
+    # In production (RAILWAY_ENVIRONMENT/BASE_URL set) refusing to boot without
+    # a persistent SECRET_KEY is safer than silently ephemeral sessions that
+    # log users out on every restart. In local dev we keep the warning.
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("BASE_URL", "").startswith("https"):
+        logger.error(
+            "SECRET_KEY not set in production environment — sessions will NOT "
+            "survive restarts. Set a persistent SECRET_KEY in Railway env vars."
+        )
+    else:
+        logger.warning(
+            "SECRET_KEY not set — generated ephemeral key "
+            "(sessions won't survive restarts)"
+        )
 app.secret_key = _secret
 
 # ── Session cookie config (critical for mobile browsers) ─────────────────────
@@ -363,12 +375,58 @@ else:
     DATA_FILE = ROOT_DIR / "data.json"
 
     def load_data():
-        if DATA_FILE.exists():
-            return json.loads(DATA_FILE.read_text())
-        return {"watchers": [], "subscriptions": []}
+        """
+        Load watcher/subscription state from data.json.
+
+        Recovers gracefully from a corrupted JSON file by renaming it aside
+        and starting fresh so the app never crash-loops on a truncated write.
+        """
+        if not DATA_FILE.exists():
+            return {"watchers": [], "subscriptions": []}
+        try:
+            text = DATA_FILE.read_text(encoding="utf-8")
+            if not text.strip():
+                return {"watchers": [], "subscriptions": []}
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("data.json root is not an object")
+            data.setdefault("watchers", [])
+            data.setdefault("subscriptions", [])
+            return data
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            try:
+                backup = DATA_FILE.with_suffix(
+                    f".corrupt.{int(time.time())}.json"
+                )
+                DATA_FILE.rename(backup)
+                logger.error(
+                    f"data.json was corrupted ({e}); moved to {backup.name} "
+                    f"and started with fresh empty state"
+                )
+            except Exception as ee:
+                logger.error(f"data.json corrupt AND could not rename: {ee}")
+            return {"watchers": [], "subscriptions": []}
 
     def save_data(data):
-        DATA_FILE.write_text(json.dumps(data, indent=2))
+        """
+        Atomic JSON save: write to a temp file in the same directory,
+        fsync, then os.replace() — prevents leaving a half-written
+        data.json on disk if we're SIGKILL'd mid-write (Railway deploy
+        drain, OOM, etc.).
+        """
+        try:
+            tmp = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+            payload = json.dumps(data, indent=2)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, DATA_FILE)
+        except Exception as e:
+            logger.error(f"save_data failed: {e}")
 
     def delete_watcher_db(watcher_id):
         pass
@@ -1149,59 +1207,23 @@ def bms_session_status():
                 "email_verified": parsed.get("EMAILVERIFIED") == "Y",
             })
         except Exception as e:
-            logger.debug(f"Failed to parse 'ud' cookie: {e}")
+            logger.warning(f"bms_session_status: could not parse 'ud' cookie: {e}")
 
     return jsonify(info)
 
-
-@app.route("/health")
-def health():
-    """
-    Liveness probe for Railway / uptime monitors.
-
-    Returns 200 as long as the Flask worker is responsive, even if the
-    background monitor thread or the database is temporarily degraded —
-    that way a transient wobble can't kill a deploy. Use the response
-    body to see the actual state of each subsystem.
-    """
-    db_ok = True
-    if DATABASE_URL:
-        try:
-            with _get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-        except Exception:
-            db_ok = False
-    monitor_ok = _monitor_thread is not None and _monitor_thread.is_alive()
-    status = "ok" if (db_ok and monitor_ok) else "degraded"
-    return jsonify({
-        "status": status,
-        "ts": datetime.now().isoformat(),
-        "database": "connected" if db_ok else "error",
-        "monitor": "running" if monitor_ok else "stopped",
-    }), 200
-
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Not found"}), 404
-    return render_template("index.html", vapid_public_key=VAPID_PUBLIC_KEY), 404
-
-@app.errorhandler(500)
-def internal_error(e):
-    logger.error(f"Internal error: {e}")
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Internal server error"}), 500
-    return render_template("index.html", vapid_public_key=VAPID_PUBLIC_KEY), 500
 
 @app.route("/sw.js")
 def service_worker():
     return send_from_directory(app.static_folder, "sw.js", mimetype="application/javascript")
 
+
 @app.route("/manifest.json")
 def manifest():
     return send_from_directory(app.static_folder, "manifest.json")
 
+
+@app.route("/api/cart-status/<watcher_id>")
+def cart_status(watcher_id):
     """
     Frontend polls this to track cart progress for a watcher.
     Returns { status, message, cart_url, session_id }.
@@ -1213,7 +1235,7 @@ def manifest():
 
 @app.route("/api/checkout-status/<session_id>")
 def checkout_status(session_id):
-    """Legacy alias — frontend polls session_id directly."""
+    """Legacy alias - frontend polls session_id directly."""
     return jsonify(get_session(session_id))
 
 
@@ -1221,3 +1243,4 @@ if __name__ == "__main__":
     start_monitor()   # start_monitor() calls start_worker() internally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
