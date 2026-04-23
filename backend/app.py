@@ -1239,8 +1239,35 @@ def checkout_status(session_id):
     return jsonify(get_session(session_id))
 
 
+@app.route("/health")
+def health():
+    """
+    Liveness probe for Railway / uptime monitors.
+
+    Always returns HTTP 200 so a transient wobble (DB flap, monitor
+    restart) can't kill a deploy.
+    The response body surfaces the actual state of each subsystem
+    for debugging.
+    """
+    db_ok = True
+    if DATABASE_URL:
+        try:
+            with _get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+        except Exception:
+            db_ok = False
+    monitor_ok = _monitor_thread is not None and _monitor_thread.is_alive()
+    status = "ok" if (db_ok and monitor_ok) else "degraded"
+    return jsonify({
+        "status":   status,
+        "ts":       datetime.now().isoformat(),
+        "database": "connected" if db_ok else "error",
+        "monitor":  "running" if monitor_ok else "stopped",
+    }), 200
+
+
 if __name__ == "__main__":
     start_monitor()   # start_monitor() calls start_worker() internally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
