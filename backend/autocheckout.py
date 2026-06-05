@@ -54,6 +54,7 @@ from typing import Optional
 from playwright.async_api import Error as PlaywrightError
 
 from . import cookie_manager
+from . import fingerprint
 
 logger = logging.getLogger("ticketalert.checkout")
 
@@ -81,44 +82,12 @@ DEFAULT_MAX_QTY = 10
 # actually ships, otherwise Akamai flags the UA-vs-runtime mismatch and
 # blocks instantly. We build UAs at runtime from `browser.version` (see
 # _build_ua_pool()); this static list is just a sane fallback.
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
-
-
-def _build_ua_pool(browser_version: str) -> list[str]:
-    """
-    Build a pool of UA strings whose Chrome major version matches the
-    actual Chromium that Playwright just launched (prevents the Akamai
-    UA/runtime-mismatch fingerprint block).
-    """
-    # browser.version returns strings like "131.0.6778.33" or just "125.0"
-    try:
-        major = int(browser_version.split(".")[0])
-    except Exception:
-        # fallback to the static list if version parsing fails
-        return USER_AGENTS
-    v = f"{major}.0.0.0"
-    return [
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-    ]
-
-VIEWPORTS = [
-    {"width": 1920, "height": 1080},
-    {"width": 1440, "height": 900},
-    {"width": 1366, "height": 768},
-    {"width": 1536, "height": 864},
-]
+# Pools + the UA-pool builder are unified in fingerprint.py so the scraper and
+# the checkout bot ALWAYS present the same fingerprint for the same "user".
+# These aliases keep the existing references in this module working unchanged.
+USER_AGENTS = fingerprint.USER_AGENTS
+_build_ua_pool = fingerprint.build_ua_pool
+VIEWPORTS = fingerprint.VIEWPORTS
 
 # ── BookMyShow-specific selectors ────────────────────────────────────────────
 # FLAW 5 FIX: React auto-hashes classnames at build time (qty-picker_a4f21),
@@ -328,6 +297,30 @@ async def _human_scroll(page, distance: int = 400):
         await _human_delay(0.04, 0.12)
 
 
+async def _human_type(locator_or_page, text: str, selector: Optional[str] = None):
+    """
+    Type ``text`` character-by-character with randomised inter-key delays so the
+    keystroke cadence looks human (bots paste instantly — a known tell). Accepts
+    either a Locator, or a page + CSS ``selector``. Best-effort; never raises.
+    """
+    try:
+        loc = (locator_or_page.locator(selector).first
+               if selector is not None else locator_or_page)
+        await loc.click()
+        await _human_delay(0.08, 0.2)
+        for ch in text:
+            await loc.press_sequentially(ch, delay=random.uniform(40, 130))
+    except Exception:
+        # Fall back to a single fast fill so callers still get their value in.
+        try:
+            if selector is not None:
+                await locator_or_page.fill(selector, text)
+            else:
+                await locator_or_page.fill(text)
+        except Exception:
+            pass
+
+
 async def _try_click_first(page, selectors: list,
                            timeout: int = 5_000) -> bool:
     """Try each selector in order; click the first visible one."""
@@ -380,28 +373,26 @@ async def _goto_with_retry(page, url: str, *,
 # §5  PROXY CONFIGURATION — Sticky Sessions
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _build_proxy_config() -> Optional[dict]:
+def _build_proxy_config(server: Optional[str] = None) -> Optional[dict]:
     """
-    Build Playwright proxy dict with a sticky session.
+    Build a Playwright proxy dict for ``server`` (or one picked from the pool).
 
-    The proxy username is suffixed with a unique session UUID so the residential
-    proxy provider keeps a single exit IP for the entire browser context
-    lifetime, preventing Akamai from invalidating _abck cookies between loads.
+    Server selection now flows through fingerprint.py, which supports BOTH the
+    single ``PROXY_SERVER`` and a rotating ``PROXY_POOL``. Credentials are shared
+    across pool gateways (the residential-provider convention). Pass an explicit
+    ``server`` to pin the same gateway used for the earned-cookie cache key.
     """
-    if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
+    if not fingerprint.has_proxy():
         logger.warning(
-            "No proxy configured (PROXY_SERVER/PROXY_USERNAME/PROXY_PASSWORD). "
-            "Akamai will likely block datacenter IPs. Falling back to "
-            "instant URL derivation mode."
+            "No proxy configured (PROXY_SERVER/PROXY_POOL + PROXY_USERNAME/"
+            "PROXY_PASSWORD). Akamai will likely block datacenter IPs. Falling "
+            "back to instant URL derivation mode."
         )
         return None
 
-    proxy = {
-        "server":   f"http://{PROXY_SERVER}",
-        "username": PROXY_USERNAME,
-        "password": PROXY_PASSWORD,
-    }
-    logger.info(f"Proxy config activated: {PROXY_SERVER}")
+    proxy = fingerprint.playwright_proxy(server)
+    if proxy:
+        logger.info(f"Proxy config activated: {server or proxy['server']}")
     return proxy
 
 
@@ -1652,8 +1643,8 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
     _update(session_id, status="running",
             message="Starting cart session — cheapest tier + max seats...")
 
-    vp = random.choice(VIEWPORTS)
-    proxy = _build_proxy_config()
+    proxy_server = fingerprint.pick_proxy_server()
+    proxy = _build_proxy_config(proxy_server)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -1665,54 +1656,33 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
             ],
         )
 
-        # ── FLAW 3 FIX: dynamically match UA to the Chromium we just launched
-        #    so Akamai can't flag a "Chrome 131 claim from Chromium 125" mismatch.
+        # ── Coherent fingerprint ──────────────────────────────────────────────
+        # The UA major matches the Chromium we just launched (so Akamai can't
+        # flag a "Chrome 131 claim from Chromium 125" mismatch), and the platform
+        # + sec-ch-ua Client Hints below are derived from the SAME UA — every
+        # signal tells one story. Unified with the scraper via fingerprint.py.
         try:
             real_version = browser.version  # e.g. "125.0.6422.112"
-            ua_pool = _build_ua_pool(real_version)
             logger.info(f"[{session_id}] Chromium runtime version: {real_version}")
+            fp = fingerprint.get_random_fingerprint(real_version)
         except Exception:
-            ua_pool = USER_AGENTS
             real_version = "125.0.0.0"
-        ua = random.choice(ua_pool)
+            fp = fingerprint.get_random_fingerprint()
+        ua = fp["user_agent"]
+        vp = fp["viewport"]
 
-        # ── Extract major Chrome version from UA so sec-ch-ua header matches ──
-        # Akamai cross-checks User-Agent against sec-ch-ua; any mismatch is a
-        # strong bot signal. Build the header dynamically from the runtime UA.
-        _ch_major = "125"
-        try:
-            _m = re.search(r"Chrome/(\d+)", ua)
-            if _m:
-                _ch_major = _m.group(1)
-        except Exception:
-            pass
-
-        # ── Pick OS + platform from the UA so all signals tell one story ──
-        _ua_lower = ua.lower()
-        if "windows" in _ua_lower:
-            _platform = '"Windows"'
-        elif "macintosh" in _ua_lower or "mac os x" in _ua_lower:
-            _platform = '"macOS"'
-        elif "linux" in _ua_lower and "android" not in _ua_lower:
-            _platform = '"Linux"'
-        elif "android" in _ua_lower:
-            _platform = '"Android"'
-        else:
-            _platform = '"Windows"'
-
-        _sec_ch_ua = (
-            f'"Chromium";v="{_ch_major}", '
-            f'"Google Chrome";v="{_ch_major}", '
-            f'"Not=A?Brand";v="99"'
-        )
+        # sec-ch-ua / platform Client Hints, derived from the same UA via
+        # fingerprint.py so they can never contradict it.
+        _platform = fp["platform"]
+        _sec_ch_ua = fp["sec_ch_ua"]
 
         ctx_kwargs = {
             "user_agent":        ua,
             "viewport":          vp,
-            "locale":            "en-IN",
-            "timezone_id":       "Asia/Kolkata",
+            "locale":            fp["locale"],
+            "timezone_id":        fp["timezone_id"],
             "extra_http_headers": {
-                "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+                "Accept-Language": fp["accept_language"],
                 "Accept":          "text/html,application/xhtml+xml,"
                                    "application/xml;q=0.9,image/avif,"
                                    "image/webp,image/apng,*/*;q=0.8,"
@@ -1747,6 +1717,15 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
         
         # ── Inject user cookies if provided ────────────────────────────
         has_custom_cookies = await cookie_manager.inject_cookies_if_exist(ctx, session_id)
+
+        # Replay any clearance THIS exit gateway earned recently, keyed to the
+        # (proxy gateway, host) pair. Safe to reuse on a sticky/static session;
+        # on a rotating proxy a stale snapshot is ignored (TTL) and we simply
+        # earn fresh clearance during the warmup below — never a corruption risk.
+        from urllib.parse import urlparse as _urlparse
+        _earned_host = (_urlparse(checkout_url).hostname or "unknown").lower()
+        _earned_key = cookie_manager.earned_session_key(proxy_server, _earned_host)
+        await cookie_manager.load_earned_cookies(ctx, _earned_key)
 
         # ── Apply stealth patches to context ───────────────────────────
         stealth_applied = False
@@ -1998,6 +1977,15 @@ async def _run_cart(session_id: str, checkout_url: str, target_price: str,
                 )
             except Exception as _e:
                 logger.warning(f"[{session_id}] cookie snapshot failed: {_e}")
+
+            # Persist the freshly-earned CF/Akamai clearance so a later run on
+            # this same gateway can replay it and skip the handshake (subject to
+            # the IP-binding contract documented in cookie_manager).
+            try:
+                await cookie_manager.save_earned_cookies(
+                    ctx, _earned_key, proxy_server=proxy_server)
+            except Exception:
+                pass
 
             # ── Normalize /buytickets/ → /sports/ or /events/ before nav ──
             # BMS's /buytickets/<slug>/ET... URLs 404 when hit directly

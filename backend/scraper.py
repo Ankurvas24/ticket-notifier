@@ -32,6 +32,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import cookie_manager
+from . import fingerprint
 
 logger = logging.getLogger("ticketalert.scraper")
 
@@ -79,35 +80,11 @@ def _proxy_failure():
 
 
 # ── User-Agent pool ──────────────────────────────────────────────────────────
-# FLAW 3 FIX: conservative UAs that match the Chromium ACTUALLY shipped with
-# current Playwright releases (Chrome 124–126). Mismatched UAs are the #1
-# signal Akamai uses to flag automated traffic — claiming Chrome 131 while
-# running Chromium 125 is an instant block.
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
-
-
-def _build_ua_pool(browser_version: str) -> list[str]:
-    """Build a UA pool whose major version matches the launched Chromium."""
-    try:
-        major = int(browser_version.split(".")[0])
-    except Exception:
-        return USER_AGENTS
-    v = f"{major}.0.0.0"
-    return [
-        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-        f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{v} Safari/537.36",
-    ]
+# Single source of truth now lives in fingerprint.py so the scraper and the
+# checkout bot can never drift to different UAs for the "same" user (a drift
+# Akamai punishes). These module-level aliases keep existing references working.
+USER_AGENTS = fingerprint.USER_AGENTS
+_build_ua_pool = fingerprint.build_ua_pool
 
 
 # FLAW 4 FIX: Dedicated long-lived event loop for Strategy 5.
@@ -132,38 +109,37 @@ def _get_playwright_loop() -> asyncio.AbstractEventLoop:
             logger.info("Created persistent Playwright fallback event loop")
         return _PW_LOOP
 
-VIEWPORTS = [
-    {"width": 1920, "height": 1080},
-    {"width": 1440, "height": 900},
-    {"width": 1366, "height": 768},
-    {"width": 1536, "height": 864},
-]
+# Viewport pool — also unified in fingerprint.py.
+VIEWPORTS = fingerprint.VIEWPORTS
 
 
 def _get_requests_proxy() -> Optional[dict]:
-    """Build requests-compatible proxy dict (only if circuit breaker allows)."""
-    if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
-        return None
+    """
+    Build a requests-compatible proxy dict — only when the circuit breaker
+    allows. Server selection (single PROXY_SERVER or a rotating PROXY_POOL) and
+    credential encoding are delegated to fingerprint.py.
+    """
     if not _proxy_is_healthy():
         return None
-    import urllib.parse
-    safe_user = urllib.parse.quote(PROXY_USERNAME, safe='')
-    safe_pass = urllib.parse.quote(PROXY_PASSWORD, safe='')
-    proxy_url = f"http://{safe_user}:{safe_pass}@{PROXY_SERVER}"
-    return {"http": proxy_url, "https": proxy_url}
+    return fingerprint.requests_proxies()
+
+
+def _pick_playwright_proxy() -> tuple[Optional[dict], Optional[str]]:
+    """
+    Pick a Playwright proxy + the chosen ``host:port`` (only if the circuit
+    breaker allows). Returning the server lets us key the earned-cookie cache
+    to the exact exit gateway. Returns (None, None) when no proxy is usable.
+    """
+    if not _proxy_is_healthy():
+        return None, None
+    server = fingerprint.pick_proxy_server()
+    proxy = fingerprint.playwright_proxy(server)
+    return (proxy, server if proxy else None)
 
 
 def _get_playwright_proxy() -> Optional[dict]:
-    """Build Playwright-compatible proxy dict (only if circuit breaker allows)."""
-    if not all([PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD]):
-        return None
-    if not _proxy_is_healthy():
-        return None
-    return {
-        "server":   f"http://{PROXY_SERVER}",
-        "username": PROXY_USERNAME,
-        "password": PROXY_PASSWORD,
-    }
+    """Backwards-compatible accessor — returns just the proxy dict."""
+    return _pick_playwright_proxy()[0]
 
 
 # ── Status keyword lists ────────────────────────────────────────────────────
@@ -614,8 +590,7 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
     except ImportError:
         pass
 
-    vp = random.choice(VIEWPORTS)
-    proxy = _get_playwright_proxy()
+    proxy, proxy_server = _pick_playwright_proxy()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -627,22 +602,28 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
             ],
         )
 
-        # FLAW 3 FIX: build UA from the actual Chromium version just launched
+        # Coherent fingerprint: the UA major matches the launched Chromium, and
+        # the sec-ch-ua / platform Client Hints match the UA (mismatches are a
+        # top Akamai bot signal). Unified with the checkout bot via fingerprint.py.
         try:
-            ua_pool = _build_ua_pool(browser.version)
+            fp = fingerprint.get_random_fingerprint(browser.version)
         except Exception:
-            ua_pool = USER_AGENTS
-        ua = random.choice(ua_pool)
+            fp = fingerprint.get_random_fingerprint()
+        ua = fp["user_agent"]
+        vp = fp["viewport"]
 
         ctx_kwargs = {
             "user_agent":  ua,
             "viewport":    vp,
-            "locale":      "en-IN",
-            "timezone_id": "Asia/Kolkata",
+            "locale":      fp["locale"],
+            "timezone_id": fp["timezone_id"],
             "extra_http_headers": {
-                "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+                "Accept-Language":    fp["accept_language"],
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "DNT": "1",
+                "Sec-Ch-Ua":          fp["sec_ch_ua"],
+                "Sec-Ch-Ua-Mobile":   "?0",
+                "Sec-Ch-Ua-Platform": fp["platform"],
             },
         }
         if proxy:
@@ -650,8 +631,15 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
         context = await browser.new_context(**ctx_kwargs)
         
-        # Inject user cookies to bypass Akamai
+        # Inject the user's BMS auth cookies (IP-bound CF/Akamai stripped).
         await cookie_manager.inject_cookies_if_exist(context, "scraper")
+        # Then replay any clearance THIS exit IP earned recently, keyed to the
+        # (proxy, host) pair. On the frequent direct-connection polls the server
+        # IP is stable, so this lets us skip the Akamai handshake most of the time.
+        from urllib.parse import urlparse
+        _host = (urlparse(url).hostname or "unknown").lower()
+        _earned_key = cookie_manager.earned_session_key(proxy_server, _host)
+        await cookie_manager.load_earned_cookies(context, _earned_key)
         
         page = await context.new_page()
 
@@ -776,6 +764,13 @@ async def _fetch_with_playwright(url: str) -> Optional[str]:
 
             if proxy:
                 _proxy_success()
+            # Persist the clearance we just earned (keyed to this exit IP) so the
+            # next poll can replay it instead of re-running the bot-check.
+            try:
+                await cookie_manager.save_earned_cookies(
+                    context, _earned_key, proxy_server=proxy_server)
+            except Exception:
+                pass
             return html
 
         except PWTimeout:

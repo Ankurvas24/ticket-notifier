@@ -1,0 +1,5 @@
+# Isolated deps for the Selenium reference client ONLY.
+# Kept OUT of the main ../requirements.txt so the Flask/Playwright deploy never
+# pulls Selenium. Install separately: pip install -r selenium-client/requirements.txt
+selenium>=4.15        # 4.6+ ships Selenium Manager (auto-resolves chromedriver)
+selenium-stealth>=1.0.6

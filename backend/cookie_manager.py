@@ -31,11 +31,15 @@ The user's BMS auth cookies (`bmsId`, `ud`, `G_AUTHUSER_H`, etc.)
 ride on top of that fresh CF session — so BMS sees a logged-in user.
 """
 
+import asyncio
+import hashlib
 import os
 import json
 import logging
+import random
+import time
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("ticketalert.cookie_manager")
 
@@ -322,3 +326,262 @@ def have_user_cookies() -> bool:
         return os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 10
     except Exception:
         return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BOT-EARNED COOKIE PERSISTENCE + WARM-UP
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Everything above deals with the USER's BookMyShow auth cookies — we inject
+# them and deliberately *strip* the IP-bound Cloudflare/Akamai cookies because
+# those were earned on the user's home IP and won't transfer to the bot's proxy.
+#
+# This section is the mirror image: it PERSISTS the IP-bound clearance the bot
+# *earns itself* (cf_clearance, _abck, bm_sz, ...) during warm-up, so a later
+# run on the SAME exit IP can replay it and skip the bot-check handshake
+# entirely. (This is the reference ``session_manager.py`` idea, made IP-aware
+# and TTL-bound for our Playwright stack.)
+#
+# IP-BINDING CONTRACT — read before using
+# ----------------------------------------
+# Akamai/Cloudflare clearance is cryptographically bound to the exit IP that
+# earned it. Replaying it from a different IP gets you hard-blocked. Therefore:
+#   • The cache is keyed by (proxy server + domain) via earned_session_key().
+#   • It is only SAFE to reuse when that key maps to a stable IP — i.e. a direct
+#     connection (the server's own IP, ideal for the frequent scraper polls) or
+#     a sticky/static residential session. With a rotating proxy, set a short
+#     TTL or skip replay; a stale clearance simply forces a fresh handshake, it
+#     never corrupts anything.
+
+# Where earned-cookie snapshots live (override with EARNED_COOKIES_DIR).
+EARNED_COOKIES_DIR = os.environ.get(
+    "EARNED_COOKIES_DIR",
+    os.path.join(os.path.expanduser("~"), ".ticketalert", "earned_cookies"),
+)
+
+# How long an earned snapshot stays valid. cf_clearance lives ~30 min; we use a
+# conservative 20 min default so we never replay a hair's-breadth-from-expiry
+# token. Override with EARNED_COOKIES_TTL_S.
+try:
+    EARNED_COOKIES_TTL_S = int(os.environ.get("EARNED_COOKIES_TTL_S", "1200"))
+except ValueError:
+    EARNED_COOKIES_TTL_S = 1200
+
+# Playwright's add_cookies() only accepts this key set; anything else raises.
+_PW_COOKIE_KEYS = {
+    "name", "value", "url", "domain", "path",
+    "expires", "httpOnly", "secure", "sameSite",
+}
+
+
+def _earned_dir() -> str:
+    """Return the cache dir, creating it on first use."""
+    try:
+        os.makedirs(EARNED_COOKIES_DIR, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"Could not create earned-cookie dir {EARNED_COOKIES_DIR}: {e}")
+    return EARNED_COOKIES_DIR
+
+
+def earned_session_key(proxy_server: Optional[str], domain: str) -> str:
+    """
+    Build a stable, filesystem-safe key for an earned-cookie snapshot.
+
+    Keyed by the exit network (proxy server, or ``"direct"``) AND the domain so
+    a BMS snapshot never bleeds into a District snapshot, and a snapshot earned
+    on one proxy gateway is never replayed through another.
+    """
+    network = (proxy_server or "direct").strip().lower()
+    raw = f"{network}|{(domain or '').strip().lower()}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return digest
+
+
+def _earned_path(session_key: str) -> str:
+    return os.path.join(_earned_dir(), f"{session_key}.json")
+
+
+def _playwright_safe(cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Whitelist keys + normalise sameSite so Playwright's add_cookies accepts them."""
+    out: List[Dict[str, Any]] = []
+    now = time.time()
+    for c in cookies or []:
+        if not isinstance(c, dict) or not c.get("name"):
+            continue
+        # Drop already-expired cookies (expires <= 0 means a session cookie — keep).
+        exp = c.get("expires")
+        if isinstance(exp, (int, float)) and 0 < exp < now:
+            continue
+        entry = {k: v for k, v in c.items() if k in _PW_COOKIE_KEYS}
+        if "domain" not in entry and "url" not in entry:
+            continue
+        ss = str(entry.get("sameSite", "")).strip().lower()
+        if ss in ("strict", "lax"):
+            entry["sameSite"] = ss.capitalize()
+        elif ss in ("none", "no_restriction"):
+            entry["sameSite"] = "None"
+            entry["secure"] = True  # SameSite=None requires Secure
+        else:
+            entry.pop("sameSite", None)
+        out.append(entry)
+    return out
+
+
+async def save_earned_cookies(context, session_key: str,
+                              proxy_server: Optional[str] = None) -> int:
+    """
+    Snapshot the current context's cookies (including the IP-bound CF/Akamai
+    clearance) to the cache under ``session_key``. Returns the number saved.
+
+    Call this AFTER the bot has cleared the bot-check (e.g. right after warm-up
+    or once the cart is ready).
+    """
+    try:
+        raw = await context.cookies()
+    except Exception as e:
+        logger.warning(f"[earned:{session_key}] could not read cookies: {e}")
+        return 0
+    if not raw:
+        return 0
+
+    payload = {
+        "saved_at": time.time(),
+        "proxy": proxy_server or "direct",
+        "cookies": raw,
+    }
+    try:
+        with open(_earned_path(session_key), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        logger.warning(f"[earned:{session_key}] write failed: {e}")
+        return 0
+
+    clearance = [c.get("name") for c in raw if c.get("name") in _IP_BOUND_COOKIES]
+    logger.info(
+        f"[earned:{session_key}] 💾 saved {len(raw)} cookies "
+        f"(clearance present: {clearance or 'none'})"
+    )
+    return len(raw)
+
+
+async def load_earned_cookies(context, session_key: str,
+                              max_age_s: Optional[int] = None) -> bool:
+    """
+    Inject a previously-earned cookie snapshot into ``context`` if one exists
+    and is still within TTL. Returns True if cookies were injected.
+
+    Unlike ``inject_cookies_if_exist`` (which strips IP-bound cookies), this
+    KEEPS them — the whole point is to replay the clearance on the same IP.
+    """
+    path = _earned_path(session_key)
+    if not os.path.isfile(path):
+        return False
+
+    ttl = EARNED_COOKIES_TTL_S if max_age_s is None else max_age_s
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        logger.warning(f"[earned:{session_key}] read failed: {e}")
+        return False
+
+    age = time.time() - float(payload.get("saved_at", 0))
+    if age > ttl:
+        logger.info(
+            f"[earned:{session_key}] snapshot is {age:.0f}s old (> {ttl}s TTL) "
+            f"— skipping, bot will earn fresh clearance"
+        )
+        return False
+
+    cookies = _playwright_safe(payload.get("cookies", []))
+    if not cookies:
+        return False
+
+    try:
+        await context.add_cookies(cookies)
+    except Exception as e:
+        logger.warning(f"[earned:{session_key}] batch add failed ({e}); retrying one-by-one")
+        ok = 0
+        for ck in cookies:
+            try:
+                await context.add_cookies([ck])
+                ok += 1
+            except Exception:
+                continue
+        if ok == 0:
+            return False
+
+    logger.info(
+        f"[earned:{session_key}] ♻️  replayed {len(cookies)} earned cookies "
+        f"(age {age:.0f}s) — hoping to skip the bot-check"
+    )
+    return True
+
+
+async def warm_up(page, homepage: str, settle_s: float = 5.0,
+                  human: bool = True) -> None:
+    """
+    Visit ``homepage`` and let the Akamai/Cloudflare sensor scripts run so the
+    context earns its _abck/bm_sz/cf_clearance the legitimate way.
+
+    Going straight to a deep ``/buytickets/ET...`` URL trips the
+    "suspicious entry point" heuristic; warming up on the homepage first is what
+    a real user's browser does. Does NOT persist anything — pair it with
+    ``save_earned_cookies`` (or call ``warm_up_and_persist``).
+    """
+    try:
+        await page.goto(homepage, wait_until="domcontentloaded", timeout=45_000)
+    except Exception as e:
+        logger.warning(f"warm_up goto failed for {homepage}: {e}")
+        return
+
+    # Let the sensor scripts execute and post their telemetry.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8_000)
+    except Exception:
+        pass
+
+    if human:
+        # A tiny human-like flourish so the telemetry sees real interaction.
+        try:
+            await page.mouse.move(
+                random.randint(200, 600), random.randint(150, 400),
+                steps=random.randint(8, 18),
+            )
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            await page.evaluate("window.scrollBy(0, arguments[0])",
+                                random.randint(200, 500))
+        except Exception:
+            pass
+
+    await asyncio.sleep(max(0.0, settle_s))
+
+
+async def warm_up_and_persist(context, page, homepage: str, session_key: str,
+                              proxy_server: Optional[str] = None,
+                              settle_s: float = 5.0) -> int:
+    """Convenience: warm up on ``homepage`` then snapshot the earned cookies."""
+    await warm_up(page, homepage, settle_s=settle_s)
+    return await save_earned_cookies(context, session_key, proxy_server=proxy_server)
+
+
+def clear_earned_cookies(session_key: Optional[str] = None) -> int:
+    """
+    Delete cached earned-cookie snapshots. Pass a ``session_key`` to clear one,
+    or omit it to clear the whole cache. Returns the number of files removed.
+    """
+    removed = 0
+    try:
+        if session_key:
+            p = _earned_path(session_key)
+            if os.path.isfile(p):
+                os.remove(p)
+                removed = 1
+        elif os.path.isdir(EARNED_COOKIES_DIR):
+            for fn in os.listdir(EARNED_COOKIES_DIR):
+                if fn.endswith(".json"):
+                    os.remove(os.path.join(EARNED_COOKIES_DIR, fn))
+                    removed += 1
+    except Exception as e:
+        logger.warning(f"clear_earned_cookies failed: {e}")
+    return removed
